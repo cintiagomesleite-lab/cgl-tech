@@ -77,6 +77,16 @@ input:focus{outline:2px solid var(--gold);outline-offset:0;border-color:var(--go
 .resp{display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:.82rem;}
 .resp div span{display:block;color:var(--ink-soft);font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px;}
 @media (max-width:520px){ .resp{grid-template-columns:1fr;} }
+/* envio de documentos */
+.env-drop{position:relative;border:2px dashed var(--line);border-radius:12px;padding:18px;text-align:center;background:#f8fafc;margin-top:6px;}
+.env-drop.on{border-color:var(--gold);background:var(--gold-soft);}
+.env-drop strong{display:block;font-size:.92rem;color:var(--navy-900);}
+.env-drop span{display:block;font-size:.76rem;color:var(--ink-soft);margin-top:4px;}
+.env-drop input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;}
+.env-arq{display:flex;justify-content:space-between;gap:8px;font-size:.82rem;padding:6px 0;border-top:1px solid var(--line);}
+.env-arq:first-child{border-top:0;}
+.env-arq button{background:none;border:0;color:var(--danger);font-size:.9rem;}
+select.campo,textarea.campo{width:100%;padding:11px;border:1px solid var(--line);border-radius:10px;font-size:.95rem;background:#fff;color:var(--ink);font-family:inherit;}
 </style>
 </head>
 <body>
@@ -258,7 +268,8 @@ function desenhar(){
   app.innerHTML =
     '<div class="ola"><div class="card"><h1>Olá'+(nome? ", "+esc(nome) : "")+'! 👋</h1><div class="emp">'+esc(e.nome_fantasia||e.razao_social)+' · CNPJ '+fmtCNPJ(e.cnpj)+'</div>' +
       (emps.length>1? '<select class="emp-sel" id="selEmp">'+emps.map(function(x){ return '<option value="'+x.id+'"'+(x.id===e.id?" selected":"")+'>'+esc(x.nome_fantasia||x.razao_social)+'</option>'; }).join("")+'</select>' : '') + '</div></div>' +
-    (pend.length? '<div class="card" style="border-left:4px solid var(--gold);"><h2>📋 O escritório precisa de você</h2><div class="sub">Envie pelo WhatsApp o que está pendente</div>'+htmlPend+'</div>' : '') +
+    (pend.length? '<div class="card" style="border-left:4px solid var(--gold);"><h2>📋 O escritório precisa de você</h2><div class="sub">Envie aqui embaixo, em "Enviar documentos", ou pelo WhatsApp</div>'+htmlPend+'</div>' : '') +
+    htmlEnvio(e) +
     '<div class="card"><h2>📅 Vencimentos</h2><div class="sub">Guias e obrigações da sua empresa</div>'+htmlObr+'</div>' +
     '<div class="card"><h2>💼 Honorários</h2><div class="sub">Mensalidade do escritório</div>'+htmlFat+'</div>' +
     '<div class="card"><h2>📁 Documentos</h2><div class="sub">Disponibilizados pelo escritório</div>'+htmlDoc+'</div>' +
@@ -267,7 +278,8 @@ function desenhar(){
       '<div><span>Contadora responsável</span><strong>'+esc(esc0.responsavel_nome||"")+'</strong>'+(esc0.responsavel_crc? '<br>CRC '+esc(esc0.responsavel_crc) : '')+(esc0.email? '<br>'+esc(esc0.email) : '')+(esc0.site? '<br>'+esc(esc0.site) : '')+'</div></div>' + zap + '</div>' +
     '<div class="rodape">Atualizado em '+new Date().toLocaleString("pt-BR",{dateStyle:"short",timeStyle:"short"})+' · <a href="#" id="aRecarregar" style="color:inherit;">atualizar</a> · <a href="#" id="aSenha" style="color:inherit;">trocar senha</a></div>';
 
-  var se = document.getElementById("selEmp"); if(se) se.onchange = function(){ empSel = se.value; desenhar(); window.scrollTo(0,0); };
+  var se = document.getElementById("selEmp"); if(se) se.onchange = function(){ empSel = se.value; envFila = []; desenhar(); window.scrollTo(0,0); };
+  ligarEnvio(e);
   var bp = document.getElementById("bPix"); if(bp) bp.onclick = function(){ if(navigator.clipboard) navigator.clipboard.writeText(esc0.pix).then(function(){ toast("Chave Pix copiada!"); }); };
   document.getElementById("aRecarregar").onclick = function(ev){ ev.preventDefault(); carregar(); };
   document.getElementById("aSenha").onclick = async function(ev){ ev.preventDefault(); var u = await sb.auth.getUser(); if(u.data && u.data.user) telaCriarSenha(u.data.user); };
@@ -278,6 +290,76 @@ function desenhar(){
     if(r.error || !r.data) return toast("Não foi possível abrir o documento. Fale com o escritório.");
     window.open(r.data.signedUrl, "_blank", "noopener");
   }; });
+}
+/* ---------- envio de documentos pelo cliente ---------- */
+var ENV_CAT = {NOTA_FISCAL:"Notas fiscais que emiti", EXTRATO:"Extrato bancário", DOCUMENTO:"Documento", OUTRO:"Outro"};
+var ENV_TIPOS = {pdf:"application/pdf", png:"image/png", jpg:"image/jpeg", jpeg:"image/jpeg", heic:"image/heic", webp:"image/webp",
+  docx:"application/vnd.openxmlformats-officedocument.wordprocessingml.document", xlsx:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xml:"text/xml", zip:"application/zip", csv:"text/csv", txt:"text/plain", ofx:"text/plain"};
+var ENV_MAX_MB = 20, envFila = [];
+function envTipo(nome){ var m = /\.([a-z0-9]+)$/i.exec(nome||""); return m? (ENV_TIPOS[m[1].toLowerCase()]||"") : ""; }
+function envNomeSeguro(n){ return String(n||"arquivo").normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-zA-Z0-9._-]+/g,"_").slice(-80); }
+function mesAnteriorISO(){ var d = new Date(); d.setDate(1); d.setMonth(d.getMonth()-1); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0"); }
+function htmlEnvio(e){
+  if(!Array.isArray(dados.envios)) return "";        /* banco ainda sem a função de envio */
+  var meus = dados.envios.filter(function(x){ return x.empresa_id===e.id; }).slice(0,8);
+  return '<div class="card"><h2>📤 Enviar documentos</h2><div class="sub">Mande para o escritório as notas que você emitiu (XML ou PDF), extratos e outros documentos</div>' +
+    '<div class="env-drop" id="envDrop"><strong>Toque aqui para escolher os arquivos</strong><span>ou arraste para cá · PDF, XML, ZIP, foto, Excel — até '+ENV_MAX_MB+' MB cada</span>' +
+    '<input type="file" id="envInp" multiple accept="'+Object.keys(ENV_TIPOS).map(function(x){ return "."+x; }).join(",")+'"></div>' +
+    '<div id="envForm" style="display:none;margin-top:10px;"><div id="envLista"></div>' +
+    '<label for="envCat">O que você está enviando?</label><select class="campo" id="envCat">'+Object.keys(ENV_CAT).map(function(k){ return '<option value="'+k+'">'+ENV_CAT[k]+'</option>'; }).join("")+'</select>' +
+    '<label for="envMes">Mês de referência</label><input type="month" id="envMes" value="'+mesAnteriorISO()+'">' +
+    '<label for="envObs">Recado para o escritório (opcional)</label><textarea class="campo" id="envObs" rows="2" maxlength="500" placeholder="Ex.: notas de outubro, faltou uma que mando amanhã"></textarea>' +
+    '<button class="btn pri" style="width:100%;margin-top:12px;" id="envBtn">Enviar</button></div>' +
+    (meus.length? '<div class="sub" style="margin:14px 0 0;">Seus envios recentes</div>' + meus.map(function(x){
+      var tag = x.status==="PROCESSADO"? '<span class="tag ok">Recebido pelo escritório ✓</span>' : x.status==="VISTO"? '<span class="tag neutral">Visto</span>' : '<span class="tag warn">Enviado</span>';
+      return '<div class="item"><div class="main"><div class="t" style="font-weight:500;word-break:break-all;">'+esc(x.nome_arquivo)+tag+'</div><div class="d">'+esc(ENV_CAT[x.categoria]||x.categoria)+(x.competencia? " · "+esc(compLabel(x.competencia)) : "")+' · enviado em '+fmtData(x.criado_em)+'</div></div></div>'; }).join("") : '') +
+    '</div>';
+}
+function ligarEnvio(e){
+  var inp = document.getElementById("envInp"); if(!inp) return;
+  var drop = document.getElementById("envDrop"), form = document.getElementById("envForm");
+  function lista(){
+    form.style.display = envFila.length? "" : "none";
+    document.getElementById("envLista").innerHTML = envFila.map(function(f, i){
+      return '<div class="env-arq"><span style="word-break:break-all;">📄 '+esc(f.name)+' <span style="color:var(--ink-soft);">('+(f.size<1048576? Math.max(1,Math.round(f.size/1024))+' KB' : (f.size/1048576).toFixed(1).replace(".",",")+' MB')+')</span></span><button data-tira="'+i+'" aria-label="Tirar">✕</button></div>'; }).join("");
+    Array.prototype.forEach.call(document.querySelectorAll("[data-tira]"), function(b){ b.onclick = function(){ envFila.splice(Number(b.getAttribute("data-tira")),1); lista(); }; });
+    var cat = document.getElementById("envCat");
+    if(cat && envFila.length && envFila.every(function(f){ return /\.(xml|zip)$/i.test(f.name); })) cat.value = "NOTA_FISCAL";
+  }
+  function somar(arqs){
+    var recusados = [];
+    Array.prototype.forEach.call(arqs, function(f){
+      if(!envTipo(f.name)) recusados.push(f.name+" (tipo não aceito)");
+      else if(f.size > ENV_MAX_MB*1024*1024) recusados.push(f.name+" (maior que "+ENV_MAX_MB+" MB)");
+      else envFila.push(f);
+    });
+    if(recusados.length) toast("Não dá para enviar: "+recusados.join(", "));
+    lista();
+  }
+  inp.onchange = function(){ somar(inp.files); inp.value = ""; };
+  drop.addEventListener("dragover", function(ev){ ev.preventDefault(); drop.classList.add("on"); });
+  drop.addEventListener("dragleave", function(){ drop.classList.remove("on"); });
+  drop.addEventListener("drop", function(ev){ ev.preventDefault(); drop.classList.remove("on"); somar(ev.dataTransfer.files||[]); });
+  lista();
+  document.getElementById("envBtn").onclick = async function(){
+    var b = this, escId = (dados.escritorio||{}).id, cat = document.getElementById("envCat").value, mes = document.getElementById("envMes").value, obs = document.getElementById("envObs").value;
+    if(!envFila.length || !escId) return;
+    b.disabled = true; var ok = 0, falhas = [];
+    for(var i=0;i<envFila.length;i++){
+      var f = envFila[i]; b.textContent = "Enviando "+(i+1)+" de "+envFila.length+"…";
+      var path = escId+"/cliente/"+e.id+"/"+Date.now()+"_"+Math.random().toString(36).slice(2,8)+"_"+envNomeSeguro(f.name);
+      var up = await sb.storage.from("documentos").upload(path, f, {upsert:false, contentType:envTipo(f.name)});
+      if(up.error){ falhas.push(f.name); continue; }
+      var r = await sb.rpc("portal_registrar_envio", {p_empresa:e.id, p_path:path, p_nome:f.name, p_tamanho:f.size, p_categoria:cat, p_competencia: mes? mes+"-01" : null, p_obs:obs});
+      if(r.error){ falhas.push(f.name+": "+traduz(r.error)); continue; }
+      ok++;
+    }
+    envFila = [];
+    if(ok) toast(ok===1? "Arquivo enviado ao escritório! ✓" : ok+" arquivos enviados ao escritório! ✓");
+    if(falhas.length) setTimeout(function(){ toast("Não foi possível enviar: "+falhas.join("; ")); }, ok? 3300 : 0);
+    carregar();
+  };
 }
 function addDiasISO(iso, n){ var d = new Date(iso+"T12:00:00"); d.setDate(d.getDate()+n); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); }
 
