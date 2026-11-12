@@ -269,6 +269,7 @@ function desenhar(){
   app.innerHTML =
     '<div class="ola"><div class="card"><h1>Olá'+(nome? ", "+esc(nome) : "")+'! 👋</h1><div class="emp">'+esc(e.nome_fantasia||e.razao_social)+' · CNPJ '+fmtCNPJ(e.cnpj)+'</div>' +
       (emps.length>1? '<select class="emp-sel" id="selEmp">'+emps.map(function(x){ return '<option value="'+x.id+'"'+(x.id===e.id?" selected":"")+'>'+esc(x.nome_fantasia||x.razao_social)+'</option>'; }).join("")+'</select>' : '') + '</div></div>' +
+    htmlPendenciasMes(e, abertas) +
     (pend.length? '<div class="card" style="border-left:4px solid var(--gold);"><h2>📋 O escritório precisa de você</h2><div class="sub">Envie aqui embaixo, em "Enviar documentos", ou pelo WhatsApp</div>'+htmlPend+'</div>' : '') +
     htmlPedido(e) + htmlEnvio(e) +
     '<div class="card"><h2>📅 Vencimentos</h2><div class="sub">Guias e obrigações da sua empresa</div>'+htmlObr+'</div>' +
@@ -281,6 +282,12 @@ function desenhar(){
 
   var se = document.getElementById("selEmp"); if(se) se.onchange = function(){ empSel = se.value; envFila = []; desenhar(); window.scrollTo(0,0); };
   ligarEnvio(e); ligarPedido(e);
+  Array.prototype.forEach.call(document.querySelectorAll("[data-enviar-doc]"), function(b){ b.onclick = function(){
+    envCatSel = DOC_PARA_CAT[b.getAttribute("data-enviar-doc")] || "";
+    var cat = document.getElementById("envCat"); if(cat && envCatSel) cat.value = envCatSel;
+    var dr = document.getElementById("envDrop"); if(dr) dr.scrollIntoView({behavior:"smooth", block:"center"});
+    var inp = document.getElementById("envInp"); if(inp) inp.click();
+  }; });
   var bp = document.getElementById("bPix"); if(bp) bp.onclick = function(){ if(navigator.clipboard) navigator.clipboard.writeText(esc0.pix).then(function(){ toast("Chave Pix copiada!"); }); };
   document.getElementById("aRecarregar").onclick = function(ev){ ev.preventDefault(); carregar(); };
   document.getElementById("aSenha").onclick = async function(ev){ ev.preventDefault(); var u = await sb.auth.getUser(); if(u.data && u.data.user) telaCriarSenha(u.data.user); };
@@ -293,7 +300,31 @@ function desenhar(){
   }; });
 }
 /* ---------- envio de documentos pelo cliente ---------- */
-var ENV_CAT = {NOTA_FISCAL:"Notas que emiti (vendas/serviços)", NOTA_COMPRA:"Notas de compra (que recebi)", EXTRATO:"Extrato bancário", DOCUMENTO:"Documento", OUTRO:"Outro"};
+var ENV_CAT = {NOTA_FISCAL:"Notas que emiti (vendas/serviços)", NOTA_COMPRA:"Notas de compra (que recebi)", EXTRATO:"Extrato bancário",
+  "DOC:FOLHA":"Informações da folha (faltas, horas extras, admissões)", "DOC:DESPESAS":"Comprovantes de despesas e recibos", "DOC:OUTROS":"Outros documentos combinados",
+  DOCUMENTO:"Documento", OUTRO:"Outro"};
+/* documento do mês -> opção do "O que você está enviando?" */
+var DOC_PARA_CAT = {EXTRATO:"EXTRATO", NOTAS_COMPRA:"NOTA_COMPRA", NOTAS_VENDA:"NOTA_FISCAL", FOLHA:"DOC:FOLHA", DESPESAS:"DOC:DESPESAS", OUTROS:"DOC:OUTROS"};
+var envCatSel = "";
+/* ---------- pendências com o escritório (documentos do mês + honorário em atraso) ---------- */
+function htmlPendenciasMes(e, abertas){
+  var h = hoje(), dm = (dados.docs_mes||[]).find(function(x){ return x.empresa_id===e.id; });
+  var atrasados = (abertas||[]).filter(function(x){ return x.vencimento<h; });
+  var faltam = dm? (dm.docs||[]).filter(function(x){ return !x.recebido; }) : [];
+  if(!dm && !atrasados.length) return "";
+  var passou = dm && h>dm.dia_limite;
+  var linhasDoc = dm? (dm.docs||[]).map(function(x){
+    return '<div class="item"><div class="main"><div class="t" style="font-weight:500;">'+esc(x.nome) +
+      (x.recebido? '<span class="tag ok">Recebido ✓</span>' : passou? '<span class="tag danger">Atrasado</span>' : '<span class="tag warn">Pendente</span>')+'</div></div>' +
+      (x.recebido? '' : '<button class="btn leve peq" data-enviar-doc="'+esc(x.codigo)+'">Enviar</button>')+'</div>'; }).join("") : '';
+  var tot = atrasados.reduce(function(s, x){ return s+Number(x.valor||0); }, 0);
+  var pend = faltam.length || atrasados.length;
+  return '<div class="card" style="border-left:4px solid '+(pend? (passou||atrasados.length? "#dc2626" : "var(--gold)") : "#059669")+';">' +
+    '<h2>'+(pend? "⚠️ Pendências com o escritório" : "✅ Tudo em dia com o escritório")+'</h2>' +
+    (dm? '<div class="sub">Documentos de '+esc(compLabel(dm.competencia))+' — prazo: '+fmtData(dm.dia_limite)+(faltam.length? '' : ' · todos recebidos, obrigado!')+'</div>'+linhasDoc : '') +
+    (atrasados.length? '<div class="item"><div class="main"><div class="t">Honorário em atraso<span class="tag danger">'+atrasados.length+'</span></div><div class="d">Veja os detalhes e o Pix em “Honorários”, mais abaixo</div></div><div class="v">'+fmtMoeda(tot)+'</div></div>' : '') +
+    '</div>';
+}
 var ENV_TIPOS = {pdf:"application/pdf", png:"image/png", jpg:"image/jpeg", jpeg:"image/jpeg", heic:"image/heic", webp:"image/webp",
   docx:"application/vnd.openxmlformats-officedocument.wordprocessingml.document", xlsx:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   xml:"text/xml", zip:"application/zip", csv:"text/csv", txt:"text/plain", ofx:"text/plain"};
@@ -370,7 +401,7 @@ function htmlEnvio(e){
     '<div class="env-drop" id="envDrop"><strong>Toque aqui para escolher os arquivos</strong><span>ou arraste para cá · PDF, XML, ZIP, foto, Excel — até '+ENV_MAX_MB+' MB cada</span>' +
     '<input type="file" id="envInp" multiple accept="'+Object.keys(ENV_TIPOS).map(function(x){ return "."+x; }).join(",")+'"></div>' +
     '<div id="envForm" style="display:none;margin-top:10px;"><div id="envLista"></div>' +
-    '<label for="envCat">O que você está enviando?</label><select class="campo" id="envCat">'+Object.keys(ENV_CAT).map(function(k){ return '<option value="'+k+'">'+ENV_CAT[k]+'</option>'; }).join("")+'</select>' +
+    '<label for="envCat">O que você está enviando?</label><select class="campo" id="envCat">'+Object.keys(ENV_CAT).map(function(k){ return '<option value="'+k+'"'+(k===envCatSel?" selected":"")+'>'+ENV_CAT[k]+'</option>'; }).join("")+'</select>' +
     '<label for="envMes">Mês de referência</label><input type="month" id="envMes" value="'+mesAnteriorISO()+'">' +
     '<label for="envObs">Recado para o escritório (opcional)</label><textarea class="campo" id="envObs" rows="2" maxlength="500" placeholder="Ex.: notas de outubro, faltou uma que mando amanhã"></textarea>' +
     '<button class="btn pri" style="width:100%;margin-top:12px;" id="envBtn">Enviar</button></div>' +
@@ -388,7 +419,7 @@ function ligarEnvio(e){
       return '<div class="env-arq"><span style="word-break:break-all;">📄 '+esc(f.name)+' <span style="color:var(--ink-soft);">('+(f.size<1048576? Math.max(1,Math.round(f.size/1024))+' KB' : (f.size/1048576).toFixed(1).replace(".",",")+' MB')+')</span></span><button data-tira="'+i+'" aria-label="Tirar">✕</button></div>'; }).join("");
     Array.prototype.forEach.call(document.querySelectorAll("[data-tira]"), function(b){ b.onclick = function(){ envFila.splice(Number(b.getAttribute("data-tira")),1); lista(); }; });
     var cat = document.getElementById("envCat");
-    if(cat && envFila.length && envFila.every(function(f){ return /\.(xml|zip)$/i.test(f.name); })) cat.value = "NOTA_FISCAL";
+    if(cat && !envCatSel && envFila.length && envFila.every(function(f){ return /\.(xml|zip)$/i.test(f.name); })) cat.value = "NOTA_FISCAL";
   }
   function somar(arqs){
     var recusados = [];
@@ -414,11 +445,14 @@ function ligarEnvio(e){
       var path = escId+"/cliente/"+e.id+"/"+Date.now()+"_"+Math.random().toString(36).slice(2,8)+"_"+envNomeSeguro(f.name);
       var up = await sb.storage.from("documentos").upload(path, f, {upsert:false, contentType:envTipo(f.name)});
       if(up.error){ falhas.push(f.name); continue; }
-      var r = await sb.rpc("portal_registrar_envio", {p_empresa:e.id, p_path:path, p_nome:f.name, p_tamanho:f.size, p_categoria:cat, p_competencia: mes? mes+"-01" : null, p_obs:obs});
+      var docCod = cat.indexOf("DOC:")===0? cat.slice(4) : "";
+      var r = await sb.rpc("portal_registrar_envio", {p_empresa:e.id, p_path:path, p_nome:f.name, p_tamanho:f.size, p_categoria: docCod? "DOCUMENTO" : cat, p_competencia: mes? mes+"-01" : null, p_obs:obs});
       if(r.error){ falhas.push(f.name+": "+traduz(r.error)); continue; }
+      /* documento do mês (folha, despesas, outros): avisa qual é, para sair da cobrança */
+      if(docCod && r.data){ try{ await sb.rpc("portal_vincular_doc", {p_envio:r.data, p_codigo:docCod, p_competencia: mes? mes+"-01" : null}); }catch(_){} }
       ok++;
     }
-    envFila = [];
+    envFila = []; envCatSel = "";
     if(ok) toast(ok===1? "Arquivo enviado ao escritório! ✓" : ok+" arquivos enviados ao escritório! ✓");
     if(falhas.length) setTimeout(function(){ toast("Não foi possível enviar: "+falhas.join("; ")); }, ok? 3300 : 0);
     carregar();
