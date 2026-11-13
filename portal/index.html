@@ -87,6 +87,14 @@ input:focus{outline:2px solid var(--gold);outline-offset:0;border-color:var(--go
 .env-arq:first-child{border-top:0;}
 .env-arq button{background:none;border:0;color:var(--danger);font-size:.9rem;}
 select.campo,textarea.campo{width:100%;padding:11px;border:1px solid var(--line);border-radius:10px;font-size:.95rem;background:#fff;color:var(--ink);font-family:inherit;}
+.notif{border-top:1px solid #e5e7eb;padding:10px 0}
+.notif summary{cursor:pointer;list-style:none}
+.notif summary::-webkit-details-marker{display:none}
+.notif-texto{white-space:pre-wrap;font-size:.86rem;line-height:1.5;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:12px;margin-top:8px;max-height:420px;overflow:auto}
+.notif-cod{margin-top:10px;font-size:.72rem;color:#64748b}
+.notif-acoes{margin-top:8px}
+.notif .d{font-size:.8rem;color:#64748b;font-weight:400}
+.notif-ciencia{margin-top:10px;padding:10px;border:1px solid #fecaca;background:#fef2f2;border-radius:8px}
 </style>
 </head>
 <body>
@@ -269,7 +277,7 @@ function desenhar(){
   app.innerHTML =
     '<div class="ola"><div class="card"><h1>Olá'+(nome? ", "+esc(nome) : "")+'! 👋</h1><div class="emp">'+esc(e.nome_fantasia||e.razao_social)+' · CNPJ '+fmtCNPJ(e.cnpj)+'</div>' +
       (emps.length>1? '<select class="emp-sel" id="selEmp">'+emps.map(function(x){ return '<option value="'+x.id+'"'+(x.id===e.id?" selected":"")+'>'+esc(x.nome_fantasia||x.razao_social)+'</option>'; }).join("")+'</select>' : '') + '</div></div>' +
-    htmlPendenciasMes(e, abertas) +
+    htmlNotificacoes(e) + htmlPendenciasMes(e, abertas) +
     (pend.length? '<div class="card" style="border-left:4px solid var(--gold);"><h2>📋 O escritório precisa de você</h2><div class="sub">Envie aqui embaixo, em "Enviar documentos", ou pelo WhatsApp</div>'+htmlPend+'</div>' : '') +
     htmlPedido(e) + htmlEnvio(e) +
     '<div class="card"><h2>📅 Vencimentos</h2><div class="sub">Guias e obrigações da sua empresa</div>'+htmlObr+'</div>' +
@@ -281,7 +289,7 @@ function desenhar(){
     '<div class="rodape">Atualizado em '+new Date().toLocaleString("pt-BR",{dateStyle:"short",timeStyle:"short"})+' · <a href="#" id="aRecarregar" style="color:inherit;">atualizar</a> · <a href="#" id="aSenha" style="color:inherit;">trocar senha</a></div>';
 
   var se = document.getElementById("selEmp"); if(se) se.onchange = function(){ empSel = se.value; envFila = []; desenhar(); window.scrollTo(0,0); };
-  ligarEnvio(e); ligarPedido(e);
+  ligarEnvio(e); ligarPedido(e); ligarNotificacoes();
   Array.prototype.forEach.call(document.querySelectorAll("[data-enviar-doc]"), function(b){ b.onclick = function(){
     envCatSel = DOC_PARA_CAT[b.getAttribute("data-enviar-doc")] || "";
     var cat = document.getElementById("envCat"); if(cat && envCatSel) cat.value = envCatSel;
@@ -306,6 +314,43 @@ var ENV_CAT = {NOTA_FISCAL:"Notas que emiti (vendas/serviços)", NOTA_COMPRA:"No
 /* documento do mês -> opção do "O que você está enviando?" */
 var DOC_PARA_CAT = {EXTRATO:"EXTRATO", NOTAS_COMPRA:"NOTA_COMPRA", NOTAS_VENDA:"NOTA_FISCAL", FOLHA:"DOC:FOLHA", DESPESAS:"DOC:DESPESAS", OUTROS:"DOC:OUTROS"};
 var envCatSel = "";
+/* ---------- notificações do escritório (com "Li e estou ciente") ---------- */
+function htmlNotificacoes(e){
+  var l = (dados.notificacoes||[]).filter(function(n){ return n.empresa_id===e.id; });
+  if(!l.length) return "";
+  var pend = l.filter(function(n){ return !n.ciente_em; }).length;
+  return '<div class="card" style="border-left:4px solid '+(pend? "#dc2626" : "var(--ink-soft)")+';"><h2>📄 Notificações do escritório</h2>' +
+    '<div class="sub">'+(pend? "Leia com atenção e confirme a leitura" : "Comunicados formais do escritório")+'</div>' +
+    l.map(function(n){
+      return '<details class="notif"'+(n.ciente_em? "" : " open")+'><summary><strong>'+esc(n.titulo)+' nº '+esc(n.numero)+'</strong>' +
+        (n.ciente_em? '<span class="tag ok">Ciência em '+fmtData(n.ciente_em)+'</span>' : '<span class="tag danger">Aguardando sua ciência</span>') +
+        '<div class="d">Emitida em '+fmtData(n.emitida_em)+(n.prazo_ate? ' · prazo até '+fmtData(n.prazo_ate) : '')+(n.efeito_em? ' · a partir de '+fmtData(n.efeito_em) : '')+'</div></summary>' +
+        '<div class="notif-texto" id="nt-'+esc(n.id)+'">'+esc(n.texto)+'<div class="notif-cod">Código de verificação: '+esc(String(n.codigo||"").slice(0,32))+'</div></div>' +
+        '<div class="notif-acoes"><button class="btn leve peq" data-nt-imprimir="'+esc(n.id)+'">Imprimir / salvar PDF</button></div>' +
+        (n.ciente_em? '<div class="d" style="margin-top:6px;">Ciência registrada por '+esc(n.ciente_nome||"")+' em '+new Date(n.ciente_em).toLocaleString("pt-BR")+'.</div>'
+          : '<div class="notif-ciencia"><label for="ntn-'+esc(n.id)+'">Para confirmar que leu, digite seu nome completo:</label>' +
+            '<input class="campo" id="ntn-'+esc(n.id)+'" maxlength="200" placeholder="Seu nome completo">' +
+            '<button class="btn pri" style="width:100%;margin-top:8px;" data-nt-ciente="'+esc(n.id)+'">Li e estou ciente</button>' +
+            '<div class="d" style="margin-top:6px;">A confirmação registra a data, a hora e o endereço de internet (IP). Ela indica que você leu o comunicado; não significa concordância com o conteúdo.</div></div>') +
+        '</details>';
+    }).join("") + '</div>';
+}
+function ligarNotificacoes(){
+  Array.prototype.forEach.call(document.querySelectorAll("[data-nt-ciente]"), function(b){ b.onclick = async function(){
+    var id = b.getAttribute("data-nt-ciente"), nome = (document.getElementById("ntn-"+id).value||"").trim();
+    if(nome.length<5 || nome.indexOf(" ")<0) return toast("Digite seu nome completo para confirmar.");
+    b.disabled = true; b.textContent = "Registrando…";
+    var r = await sb.rpc("portal_dar_ciencia", {p_id:id, p_nome:nome});
+    if(r.error){ b.disabled = false; b.textContent = "Li e estou ciente"; return toast(traduz(r.error)); }
+    toast("Ciência registrada. Obrigado!"); carregar();
+  }; });
+  Array.prototype.forEach.call(document.querySelectorAll("[data-nt-imprimir]"), function(b){ b.onclick = function(){
+    var el = document.getElementById("nt-"+b.getAttribute("data-nt-imprimir")); if(!el) return;
+    var w = window.open("", "_blank"); if(!w) return toast("Permita a abertura de janelas para imprimir.");
+    w.document.write('<!doctype html><meta charset="utf-8"><title>Notificação</title><body style="font-family:Arial,sans-serif;font-size:13px;line-height:1.5;max-width:720px;margin:30px auto;white-space:pre-wrap;">'+el.innerHTML+'</body>');
+    w.document.close(); w.focus(); w.print();
+  }; });
+}
 /* ---------- pendências com o escritório (documentos do mês + honorário em atraso) ---------- */
 function htmlPendenciasMes(e, abertas){
   var h = hoje(), dm = (dados.docs_mes||[]).find(function(x){ return x.empresa_id===e.id; });
