@@ -1,0 +1,37 @@
+NOTIFICAÇÕES CONTRATUAIS — PASSO A PASSO
+=========================================
+
+ONDE FICA
+  Sistema > Cobranças > aba "Notificações contratuais"  (ou o botão "⚖ Notificar" em cada cobrança da fila).
+
+OS 4 MODELOS (use em escada)
+  1. Notificação de pendências ......... lista honorários em atraso, acessos não liberados (gov.br/e-CAC etc.),
+                                          documentos não enviados e tentativas de contato; dá prazo (padrão 10 dias).
+  2. Ressalva de responsabilidade ...... lista as obrigações não entregues por falta de acesso/documentos e
+                                          registra que multas e encargos são de responsabilidade do cliente.
+  3. Suspensão dos serviços ............ suspende a partir de uma data (art. 476 do Código Civil) até regularizar.
+  4. Rescisão do contrato .............. aviso prévio de 30 dias (contrato + art. 599 do Código Civil), devolução
+                                          de documentos, transição para o novo contador e revogação de procurações.
+  O sistema já preenche honorários em atraso (Financeiro) e obrigações em atraso (Agenda Fiscal).
+  Você marca o que se aplica, revisa o texto e emite.
+
+DEPOIS DE EMITIR
+  - Recebe número (ex.: 2026/001) e código de verificação; o texto não pode mais ser alterado (só cancelado).
+  - ⤓ PDF ........... papel timbrado, para assinar e mandar pelos Correios com AR ou registrar em cartório.
+  - ✉ E-mail ........ manda com o PDF anexo e cópia para o e-mail do escritório (precisa do Resend configurado).
+  - WhatsApp ........ mensagem pronta avisando da notificação e do link do Portal.
+  - Portal .......... o cliente lê e clica "Li e estou ciente"; fica registrado nome, data, hora e IP.
+  Tudo fica no histórico da aba, com o que foi enviado e quando.
+
+IMPORTANTE
+  Os modelos são uma base. Confira com o seu contrato de prestação de serviços (prazos, multa, foro)
+  e, em caso de dúvida ou de cliente que pode contestar, revise com um(a) advogado(a).
+  Para a prova mais forte, use também o PDF assinado com AR dos Correios ou registro em cartório.
+
+INSTALAÇÃO
+  1. Supabase > SQL Editor > New query > cole 1_SQL5_Notificacoes.sql > Run  ("Success").
+  2. Edge Functions > cintia > Code > apague tudo > cole 2_Funcao_cintia.txt > Deploy.
+  3. GitHub > cgl-tech > Add file > Upload files > arraste TUDO de dentro de 3_SITE_para_o_GitHub > Commit.
+  4. No sistema: "Atualizar agora".
+  Confira os dados do escritório em "Escritório" (CNPJ, CRC, endereço, cidade, responsável e CRC):
+  eles saem no cabeçalho e na assinatura da notificação.

@@ -1,0 +1,494 @@
+// @ts-nocheck
+/* =====================================================================
+   CGL Tech — Cint.IA, etapa 1: CONSULTORA (somente leitura)
+
+   • Roda na nuvem (Supabase Edge Function). Recebe a pergunta da contadora,
+     escolhe as ferramentas de consulta, lê os dados e responde com as fontes.
+   • Lê os dados COM O LOGIN DE QUEM PERGUNTOU: as regras do banco (RLS) valem para ela,
+     então a Cint.IA de um escritório não enxerga clientes de outro.
+   • Não grava nada nos dados dos clientes. Só registra a conversa (auditoria e consumo).
+   • O "cérebro" é trocável por configuração (segredos da função):
+       CINTIA_PROVEDOR  = anthropic | openai   ("openai" = qualquer API no padrão OpenAI:
+                          OpenAI, Google Gemini (modo compatível), ou um modelo próprio com vLLM/Ollama)
+       CINTIA_MODELO    = nome do modelo no fornecedor
+       CINTIA_CHAVE     = chave da API (fica só aqui no servidor)
+       CINTIA_URL       = (só openai) endereço base, ex.: https://api.openai.com/v1
+       CINTIA_LIMITE_TOKENS_MES = teto mensal por escritório (padrão 2.000.000)
+   ===================================================================== */
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+function resposta(obj, status = 200) {
+  return new Response(JSON.stringify(obj), { status, headers: { ...CORS, "Content-Type": "application/json" } });
+}
+function chave(env, antiga, nova) {
+  if (env[antiga]) return env[antiga];
+  try { const o = JSON.parse(env[nova] || "{}"); return o.default || Object.values(o)[0] || ""; } catch (_) { return env[nova] || ""; }
+}
+const SITUACOES_SEM_IA = ["SUSPENSA", "CANCELADA", "INADIMPLENTE", "TESTE_VENCIDO"];
+const MAX_VOLTAS = 6;
+
+/* ---------------------------------------------------------------------
+   Datas e utilidades (sempre no fuso de Brasília)
+   --------------------------------------------------------------------- */
+export function hojeBR(agora = new Date()) {
+  const d = new Date(agora.getTime() - 3 * 3600 * 1000);
+  return d.toISOString().slice(0, 10);
+}
+function somaDias(iso, n) { const d = new Date(iso + "T12:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+function ym(iso) { return String(iso || "").slice(0, 7); }
+function mesesAntes(ymStr, n) { let [a, m] = ymStr.split("-").map(Number); m -= n; while (m <= 0) { m += 12; a--; } while (m > 12) { m -= 12; a++; } return a + "-" + String(m).padStart(2, "0"); }
+const r2 = (v) => Math.round((Number(v) || 0) * 100) / 100;
+const LIMITE_MEI = 81000, SUBLIMITE_SN = 3600000, LIMITE_SN = 4800000;
+const REGIMES = { MEI: "MEI", SIMPLES_NACIONAL: "Simples Nacional", LUCRO_PRESUMIDO: "Lucro Presumido", LUCRO_REAL: "Lucro Real" };
+
+/* ---------------------------------------------------------------------
+   Ferramentas (somente leitura). Cada uma recebe o cliente do banco
+   já com o login de quem perguntou.
+   --------------------------------------------------------------------- */
+async function empresasBasicas(db, filtro = {}) {
+  let q = db.from("empresas").select("id, razao_social, nome_fantasia, cnpj, regime_tributario, anexos_simples, status, municipio, uf, data_constituicao, atividade, tem_funcionarios, servico_saude, honorario_mensal, cliente_id").order("razao_social").limit(500);
+  if (filtro.status) q = q.eq("status", filtro.status);
+  if (filtro.regime) q = q.eq("regime_tributario", filtro.regime);
+  const r = await q;
+  if (r.error) throw new Error(r.error.message);
+  let lista = r.data || [];
+  if (filtro.texto) {
+    const t = String(filtro.texto).toLowerCase(), dig = String(filtro.texto).replace(/\D/g, "");
+    lista = lista.filter((e) => (e.razao_social || "").toLowerCase().includes(t) || (e.nome_fantasia || "").toLowerCase().includes(t) || (dig.length >= 4 && (e.cnpj || "").includes(dig)));
+  }
+  return lista;
+}
+function nomeEmp(e) { return e ? (e.nome_fantasia || e.razao_social) : "—"; }
+
+/* receita por mês: apuração (se houver) senão soma das notas de saída não canceladas */
+async function receitasPorMes(db, empresaId, de, ate) {
+  const ap = await db.from("apuracoes").select("competencia, receita").eq("empresa_id", empresaId).gte("competencia", de + "-01").lte("competencia", ate + "-28");
+  const nf = await db.from("notas_fiscais").select("data_emissao, competencia, receita, situacao, operacao").eq("empresa_id", empresaId)
+    .gte("data_emissao", somaDias(de + "-01", -31)).lte("data_emissao", somaDias(ate + "-28", 35)).limit(5000);
+  const porMes = {};
+  for (const n of nf.data || []) {
+    if (n.situacao === "CANCELADA" || n.operacao === "ENTRADA") continue;
+    const m = ym(n.competencia || n.data_emissao);
+    if (m < de || m > ate) continue;
+    porMes[m] = (porMes[m] || 0) + Number(n.receita || 0);
+  }
+  for (const a of ap.data || []) { const m = ym(a.competencia); if (Number(a.receita) > 0) porMes[m] = Number(a.receita); }
+  const out = {};
+  for (let m = de; m <= ate; m = mesesAntes(m, -1)) out[m] = r2(porMes[m] || 0);
+  return out;
+}
+
+export const FERRAMENTAS = {
+  buscar_empresas: {
+    descricao: "Lista as empresas do escritório com regime, anexos do Simples, status, município, atividade e honorário. Use para descobrir o id de uma empresa pelo nome/CNPJ ou para contar e filtrar a carteira.",
+    parametros: { type: "object", properties: {
+      texto: { type: "string", description: "Parte do nome, nome fantasia ou CNPJ" },
+      regime: { type: "string", enum: ["MEI", "SIMPLES_NACIONAL", "LUCRO_PRESUMIDO", "LUCRO_REAL"] },
+      status: { type: "string", enum: ["ATIVA", "INATIVA", "BAIXADA"], description: "Padrão: todas" } } },
+    async rodar(db, a) {
+      const l = await empresasBasicas(db, a);
+      return { total: l.length, empresas: l.slice(0, 60).map((e) => ({ id: e.id, nome: nomeEmp(e), razao_social: e.razao_social, cnpj: e.cnpj, regime: REGIMES[e.regime_tributario] || e.regime_tributario,
+        anexos: e.anexos_simples || [], status: e.status, municipio: e.municipio ? e.municipio + (e.uf ? "/" + e.uf : "") : "", atividade: e.atividade, funcionarios: !!e.tem_funcionarios,
+        saude: !!e.servico_saude, honorario: Number(e.honorario_mensal || 0), constituicao: e.data_constituicao })), mostrando: Math.min(60, l.length) };
+    },
+  },
+  ficha_empresa: {
+    descricao: "Visão completa de UMA empresa: cadastro, receita dos últimos 12 meses, últimas apurações (DAS), obrigações em aberto, pendências, honorários em aberto e certificado digital.",
+    parametros: { type: "object", properties: { empresa_id: { type: "string" } }, required: ["empresa_id"] },
+    async rodar(db, a, hoje) {
+      const e = (await db.from("empresas").select("*").eq("id", a.empresa_id).maybeSingle()).data;
+      if (!e) return { erro: "Empresa não encontrada neste escritório." };
+      const ate = ym(hoje), de = mesesAntes(ate, 11);
+      const [rec, ap, ob, pe, fa, ce] = await Promise.all([
+        receitasPorMes(db, e.id, de, ate),
+        db.from("apuracoes").select("competencia, receita, das_calculado, das_declarado, status").eq("empresa_id", e.id).order("competencia", { ascending: false }).limit(6),
+        db.from("obrigacoes").select("tipo, competencia, vencimento, status").eq("empresa_id", e.id).neq("status", "CONCLUIDA").order("vencimento").limit(30),
+        db.from("pendencias").select("titulo, tipo, prioridade, criado_em").eq("empresa_id", e.id).eq("resolvida", false).limit(30),
+        db.from("faturas").select("mes_ref, ano_ref, valor, vencimento, status").eq("empresa_id", e.id).eq("status", "PENDENTE").order("vencimento").limit(24),
+        db.from("certificados").select("tipo, validade_fim, titular").eq("empresa_id", e.id).maybeSingle(),
+      ]);
+      const total12 = r2(Object.values(rec).reduce((s, v) => s + v, 0));
+      return {
+        empresa: { id: e.id, nome: nomeEmp(e), razao_social: e.razao_social, cnpj: e.cnpj, regime: REGIMES[e.regime_tributario] || e.regime_tributario, anexos: e.anexos_simples || [],
+          status: e.status, municipio: e.municipio, uf: e.uf, constituicao: e.data_constituicao, atividade: e.atividade, funcionarios: !!e.tem_funcionarios, saude: !!e.servico_saude,
+          honorario: Number(e.honorario_mensal || 0), contabilidade_fechada_ate: e.contabil_fechado_ate },
+        receita_por_mes: rec, receita_12_meses: total12,
+        apuracoes_recentes: (ap.data || []).map((x) => ({ competencia: ym(x.competencia), receita: Number(x.receita || 0), das: Number(x.das_declarado ?? x.das_calculado ?? 0), status: x.status })),
+        obrigacoes_abertas: (ob.data || []).map((o) => ({ tipo: o.tipo, competencia: o.competencia, vencimento: o.vencimento, atrasada: o.vencimento < hoje })),
+        pendencias_abertas: pe.data || [],
+        honorarios_em_aberto: (fa.data || []).map((f) => ({ referencia: String(f.mes_ref).padStart(2, "0") + "/" + f.ano_ref, valor: Number(f.valor), vencimento: f.vencimento, atrasado: f.vencimento < hoje })),
+        certificado_digital: ce.data ? { tipo: ce.data.tipo, validade: ce.data.validade_fim } : null,
+      };
+    },
+  },
+  faturamento_e_limites: {
+    descricao: "Faturamento acumulado e proximidade dos limites: MEI (R$ 81 mil no ano, proporcional no ano de abertura) e Simples Nacional (RBT12 contra o sublimite de R$ 3,6 milhões e o teto de R$ 4,8 milhões). Sem empresa_id, analisa a carteira inteira e ordena pelas mais próximas do limite.",
+    parametros: { type: "object", properties: { empresa_id: { type: "string" }, percentual_minimo: { type: "number", description: "Só mostra quem já usou pelo menos este % do limite (padrão 0)" } } },
+    async rodar(db, a, hoje) {
+      const lista = a.empresa_id ? (await empresasBasicas(db, {})).filter((e) => e.id === a.empresa_id) : await empresasBasicas(db, { status: "ATIVA" });
+      const ano = hoje.slice(0, 4), mesAtual = ym(hoje), out = [];
+      for (const e of lista.slice(0, 80)) {
+        if (e.regime_tributario === "MEI") {
+          const rec = await receitasPorMes(db, e.id, ano + "-01", mesAtual);
+          const acumulado = r2(Object.values(rec).reduce((s, v) => s + v, 0));
+          const abriuNoAno = e.data_constituicao && e.data_constituicao.slice(0, 4) === ano;
+          const limite = abriuNoAno ? r2(LIMITE_MEI / 12 * (13 - Number(e.data_constituicao.slice(5, 7)))) : LIMITE_MEI;
+          out.push({ id: e.id, nome: nomeEmp(e), regime: "MEI", receita_no_ano: acumulado, limite_do_ano: limite, uso_percentual: r2(acumulado / limite * 100),
+            observacao: abriuNoAno ? "limite proporcional (abertura em " + e.data_constituicao + ")" : "" });
+        } else if (e.regime_tributario === "SIMPLES_NACIONAL") {
+          const rec = await receitasPorMes(db, e.id, mesesAntes(mesAtual, 12), mesesAntes(mesAtual, 1));
+          const rbt12 = r2(Object.values(rec).reduce((s, v) => s + v, 0));
+          out.push({ id: e.id, nome: nomeEmp(e), regime: "Simples Nacional", anexos: e.anexos_simples || [], rbt12, sublimite: SUBLIMITE_SN, limite: LIMITE_SN,
+            uso_percentual_sublimite: r2(rbt12 / SUBLIMITE_SN * 100) });
+        }
+      }
+      const pct = (x) => x.uso_percentual ?? x.uso_percentual_sublimite ?? 0;
+      const filtrado = out.filter((x) => pct(x) >= (Number(a.percentual_minimo) || 0)).sort((x, y) => pct(y) - pct(x));
+      return { data_base: hoje, empresas: filtrado, observacao: "Receita pela apuração do mês quando existe; senão, pela soma das notas de saída não canceladas lançadas no sistema." };
+    },
+  },
+  obrigacoes: {
+    descricao: "Obrigações da Agenda Fiscal (DAS, DCTFWeb, FGTS, eSocial, DEFIS, DASN etc.): atrasadas, de hoje ou dos próximos dias. Pode filtrar por empresa.",
+    parametros: { type: "object", properties: { situacao: { type: "string", enum: ["atrasadas", "hoje", "proximas"] }, dias: { type: "number", description: "Para 'proximas' (padrão 7)" }, empresa_id: { type: "string" } }, required: ["situacao"] },
+    async rodar(db, a, hoje) {
+      let q = db.from("obrigacoes").select("empresa_id, tipo, competencia, vencimento, status").neq("status", "CONCLUIDA").order("vencimento").limit(300);
+      if (a.situacao === "atrasadas") q = q.lt("vencimento", hoje);
+      else if (a.situacao === "hoje") q = q.eq("vencimento", hoje);
+      else q = q.gte("vencimento", hoje).lte("vencimento", somaDias(hoje, Math.min(Number(a.dias) || 7, 90)));
+      if (a.empresa_id) q = q.eq("empresa_id", a.empresa_id);
+      const r = await q; if (r.error) throw new Error(r.error.message);
+      const emps = Object.fromEntries((await empresasBasicas(db, {})).map((e) => [e.id, nomeEmp(e)]));
+      return { data_base: hoje, total: (r.data || []).length, obrigacoes: (r.data || []).slice(0, 120).map((o) => ({ empresa: emps[o.empresa_id] || "?", tipo: o.tipo, competencia: o.competencia, vencimento: o.vencimento })) };
+    },
+  },
+  pendencias_e_tarefas: {
+    descricao: "Pendências abertas e tarefas não concluídas (com prazo), da carteira toda ou de uma empresa.",
+    parametros: { type: "object", properties: { empresa_id: { type: "string" } } },
+    async rodar(db, a, hoje) {
+      let p = db.from("pendencias").select("empresa_id, titulo, tipo, prioridade, criado_em, prazo, tarefa_id").eq("resolvida", false).limit(200);
+      let t = db.from("tarefas").select("empresa_id, titulo, status, prioridade, prazo").neq("status", "CONCLUIDA").order("prazo").limit(200);
+      if (a.empresa_id) { p = p.eq("empresa_id", a.empresa_id); t = t.eq("empresa_id", a.empresa_id); }
+      const [rp, rt] = await Promise.all([p, t]);
+      const emps = Object.fromEntries((await empresasBasicas(db, {})).map((e) => [e.id, nomeEmp(e)]));
+      return { data_base: hoje,
+        pendencias: (rp.data || []).map((x) => ({ empresa: x.empresa_id ? emps[x.empresa_id] || "?" : "Escritório", titulo: x.titulo, prioridade: x.prioridade, aberta_em: String(x.criado_em || "").slice(0, 10), veio_de_tarefa: !!x.tarefa_id })),
+        tarefas: (rt.data || []).map((x) => ({ empresa: x.empresa_id ? emps[x.empresa_id] || "?" : "Escritório", titulo: x.titulo, status: x.status, prazo: x.prazo, atrasada: !!x.prazo && x.prazo < hoje })) };
+    },
+  },
+  honorarios: {
+    descricao: "Honorários do escritório: em atraso (inadimplência), a receber ou recebidos no mês.",
+    parametros: { type: "object", properties: { situacao: { type: "string", enum: ["atrasados", "a_receber", "recebidos_mes"] } }, required: ["situacao"] },
+    async rodar(db, a, hoje) {
+      let q = db.from("faturas").select("empresa_id, mes_ref, ano_ref, valor, vencimento, status, data_pagamento").neq("status", "CANCELADA").limit(1000);
+      if (a.situacao === "atrasados") q = q.eq("status", "PENDENTE").lt("vencimento", hoje);
+      else if (a.situacao === "a_receber") q = q.eq("status", "PENDENTE").gte("vencimento", hoje);
+      else q = q.eq("status", "PAGA").gte("data_pagamento", ym(hoje) + "-01");
+      const r = await q; if (r.error) throw new Error(r.error.message);
+      const emps = Object.fromEntries((await empresasBasicas(db, {})).map((e) => [e.id, nomeEmp(e)]));
+      const l = (r.data || []).map((f) => ({ empresa: emps[f.empresa_id] || "?", referencia: String(f.mes_ref).padStart(2, "0") + "/" + f.ano_ref, valor: Number(f.valor), vencimento: f.vencimento, pago_em: f.data_pagamento }));
+      return { data_base: hoje, quantidade: l.length, total: r2(l.reduce((s, x) => s + x.valor, 0)), faturas: l.slice(0, 120) };
+    },
+  },
+  avisos_da_vigia: {
+    descricao: "Avisos gerados pela vigia diária (roda todo dia às 6h): MEI perto do limite, RBT12 perto do sublimite, obrigações atrasadas ou vencendo, apuração não feita, certificado vencendo, honorários atrasados há 30+ dias e pedidos de nota parados. Use para 'o que a vigia encontrou' ou para explicar um aviso.",
+    parametros: { type: "object", properties: { incluir_ignorados: { type: "boolean" }, empresa_id: { type: "string" } } },
+    async rodar(db, a) {
+      let q = db.from("cintia_alertas").select("empresa_id, tipo, gravidade, titulo, detalhe, acao_sugerida, status, criado_em").neq("status", "RESOLVIDO").limit(200);
+      if (!a.incluir_ignorados) q = q.neq("status", "IGNORADO");
+      if (a.empresa_id) q = q.eq("empresa_id", a.empresa_id);
+      const r = await q; if (r.error) return { erro: "A vigia diária ainda não foi instalada." };
+      return { total: (r.data || []).length, avisos: (r.data || []).map((x) => ({ ...x, criado_em: String(x.criado_em || "").slice(0, 10) })) };
+    },
+  },
+  alertas_do_dia: {
+    descricao: "Resumo do que pede atenção hoje no escritório: obrigações atrasadas e de hoje, certificados digitais vencendo em 30 dias, pedidos de nota e arquivos novos enviados pelos clientes, honorários atrasados e pendências urgentes.",
+    parametros: { type: "object", properties: {} },
+    async rodar(db, _a, hoje) {
+      const [ob, ce, pd, ev, fa, pe] = await Promise.all([
+        db.from("obrigacoes").select("id, vencimento").neq("status", "CONCLUIDA").lte("vencimento", hoje).limit(1000),
+        db.from("certificados").select("empresa_id, validade_fim").lte("validade_fim", somaDias(hoje, 30)).limit(200),
+        db.from("pedidos_nota").select("id").eq("status", "NOVO").limit(500),
+        db.from("envios_cliente").select("id").eq("status", "NOVO").limit(500),
+        db.from("faturas").select("valor").eq("status", "PENDENTE").lt("vencimento", hoje).limit(1000),
+        db.from("pendencias").select("id").eq("resolvida", false).eq("prioridade", "URGENTE").limit(500),
+      ]);
+      const emps = Object.fromEntries((await empresasBasicas(db, {})).map((e) => [e.id, nomeEmp(e)]));
+      const obs = ob.data || [];
+      return { data_base: hoje,
+        obrigacoes_atrasadas: obs.filter((o) => o.vencimento < hoje).length, obrigacoes_hoje: obs.filter((o) => o.vencimento === hoje).length,
+        certificados_vencendo_30_dias: (ce.data || []).map((c) => ({ empresa: emps[c.empresa_id] || "?", validade: c.validade_fim, vencido: c.validade_fim < hoje })),
+        pedidos_de_nota_novos: (pd.data || []).length, arquivos_novos_de_clientes: (ev.data || []).length,
+        honorarios_atrasados: { quantidade: (fa.data || []).length, total: r2((fa.data || []).reduce((s, f) => s + Number(f.valor), 0)) },
+        pendencias_urgentes: (pe.data || []).length };
+    },
+  },
+};
+
+/* ---------------------------------------------------------------------
+   Instruções da Cint.IA (Manifesto em prática)
+   --------------------------------------------------------------------- */
+export function instrucoes(ctx) {
+  return [
+    "Você é a Cint.IA, assistente contábil do " + (ctx.escritorio || "escritório") + ", dentro do ERP CGL Tech. Hoje é " + ctx.hoje + " (horário de Brasília).",
+    "Princípio: você AMPLIA o julgamento da contadora, nunca o substitui. Quem decide é a contadora responsável.",
+    "Regras:",
+    "1. Responda em português do Brasil, de forma direta e organizada, como uma colega contadora experiente.",
+    "2. Para qualquer dado de cliente (faturamento, obrigações, honorários, cadastro), CONSULTE as ferramentas. Nunca invente números, empresas ou datas.",
+    "3. Diga de onde veio a informação (ex.: 'pelas notas lançadas no sistema' ou 'pela apuração de outubro') e, se faltar dado no sistema, diga exatamente o que falta.",
+    "4. Nesta etapa você só CONSULTA. Não diga que fez, enviou, lançou ou alterou algo. Pode sugerir próximos passos para a contadora executar.",
+    "5. Em temas de legislação, explique o raciocínio e a base legal que conhece, deixe claro quando a norma pode ter mudado recentemente e recomende conferir a fonte oficial antes de decidir.",
+    "6. Valores em reais no formato R$ 1.234,56 e datas no formato dd/mm/aaaa.",
+    "7. Não exponha CPF de pessoas físicas sem necessidade.",
+  ].join("\n");
+}
+
+/* ---------------------------------------------------------------------
+   Camada trocável de modelo: Anthropic ou padrão OpenAI (OpenAI, Gemini compatível, vLLM/Ollama)
+   --------------------------------------------------------------------- */
+export function criarModelo(env, fetchFn) {
+  const provedor = String(env.CINTIA_PROVEDOR || "").toLowerCase(), modelo = env.CINTIA_MODELO, key = env.CINTIA_CHAVE;
+  if (!provedor || !modelo || (!key && provedor === "anthropic")) return null;
+  const ferr = Object.entries(FERRAMENTAS);
+  if (provedor === "anthropic") {
+    return {
+      provedor, modelo,
+      inicio: (hist, pergunta) => [...hist.map((m) => ({ role: m.papel === "cintia" ? "assistant" : "user", content: m.texto })), { role: "user", content: pergunta }],
+      async pensar(sistema, msgs) {
+        const r = await fetchFn("https://api.anthropic.com/v1/messages", { method: "POST",
+          headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+          body: JSON.stringify({ model: modelo, max_tokens: 2000, system: sistema, messages: msgs,
+            tools: ferr.map(([nome, f]) => ({ name: nome, description: f.descricao, input_schema: f.parametros })) }) });
+        const j = await r.json();
+        if (!r.ok) throw new Error("Modelo: " + ((j.error && j.error.message) || r.status));
+        const chamadas = (j.content || []).filter((b) => b.type === "tool_use").map((b) => ({ id: b.id, nome: b.name, args: b.input || {} }));
+        const texto = (j.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+        return { texto, chamadas, uso: { entrada: j.usage?.input_tokens || 0, saida: j.usage?.output_tokens || 0 },
+          anexar: (resultados) => { msgs.push({ role: "assistant", content: j.content }); msgs.push({ role: "user", content: resultados.map((x) => ({ type: "tool_result", tool_use_id: x.id, content: x.conteudo })) }); } };
+      },
+    };
+  }
+  /* padrão OpenAI (chat/completions com tools) */
+  const base = String(env.CINTIA_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
+  return {
+    provedor, modelo,
+    inicio: (hist, pergunta) => [...hist.map((m) => ({ role: m.papel === "cintia" ? "assistant" : "user", content: m.texto })), { role: "user", content: pergunta }],
+    async pensar(sistema, msgs) {
+      const headers = { "content-type": "application/json" }; if (key) headers.authorization = "Bearer " + key;
+      const r = await fetchFn(base + "/chat/completions", { method: "POST", headers,
+        body: JSON.stringify({ model: modelo, max_tokens: 2000, messages: [{ role: "system", content: sistema }, ...msgs],
+          tools: ferr.map(([nome, f]) => ({ type: "function", function: { name: nome, description: f.descricao, parameters: f.parametros } })) }) });
+      const j = await r.json();
+      if (!r.ok) throw new Error("Modelo: " + ((j.error && (j.error.message || j.error)) || r.status));
+      const msg = (j.choices && j.choices[0] && j.choices[0].message) || {};
+      const chamadas = (msg.tool_calls || []).map((c) => { let args = {}; try { args = JSON.parse(c.function.arguments || "{}"); } catch (_) {} return { id: c.id, nome: c.function.name, args }; });
+      return { texto: String(msg.content || "").trim(), chamadas, uso: { entrada: j.usage?.prompt_tokens || 0, saida: j.usage?.completion_tokens || 0 },
+        anexar: (resultados) => { msgs.push({ role: "assistant", content: msg.content || null, tool_calls: msg.tool_calls }); resultados.forEach((x) => msgs.push({ role: "tool", tool_call_id: x.id, content: x.conteudo })); } };
+    },
+  };
+}
+
+/* ---------------------------------------------------------------------
+   O ciclo do agente: pensa → consulta → pensa → … → responde
+   --------------------------------------------------------------------- */
+export async function executarAgente({ modelo, db, pergunta, historico, ctx }) {
+  const sistema = instrucoes(ctx), msgs = modelo.inicio(historico || [], pergunta), usadas = [], uso = { entrada: 0, saida: 0 };
+  for (let volta = 0; volta < MAX_VOLTAS; volta++) {
+    const p = await modelo.pensar(sistema, msgs);
+    uso.entrada += p.uso.entrada; uso.saida += p.uso.saida;
+    if (!p.chamadas.length) return { texto: p.texto || "Não consegui formular uma resposta.", ferramentas: usadas, uso };
+    const resultados = [];
+    for (const c of p.chamadas) {
+      const f = FERRAMENTAS[c.nome];
+      let saida;
+      try { saida = f ? await f.rodar(db, c.args || {}, ctx.hoje) : { erro: "Ferramenta desconhecida." }; }
+      catch (e) { saida = { erro: String(e && e.message || e) }; }
+      usadas.push({ nome: c.nome, args: c.args || {} });
+      resultados.push({ id: c.id, conteudo: JSON.stringify(saida).slice(0, 60000) });
+    }
+    p.anexar(resultados);
+  }
+  return { texto: "Precisei de mais consultas do que o permitido para esta pergunta. Tente perguntar de forma mais específica (por exemplo, citando a empresa).", ferramentas: usadas, uso };
+}
+
+/* liberação e teto do escritório (tabela cintia_liberacoes; controlada só pela fornecedora) */
+async function lerConfig(db, escritorio, env) {
+  const padrao = Number(env.CINTIA_LIMITE_TOKENS_MES || 2000000);
+  const r = await db.rpc("cintia_config", { p_escritorio: escritorio });
+  if (r.error || !r.data) return { liberada: false, limite: padrao };
+  const lim = r.data.limite_tokens_mes;
+  return { liberada: r.data.liberada === true, limite: lim === null || lim === undefined ? padrao : Number(lim) };
+}
+
+/* ---------------------------------------------------------------------
+   E-mails de cobrança (via Resend). Segredos: RESEND_API_KEY e CINTIA_EMAIL_REMETENTE.
+   Automático: só escritórios liberados pela CGL Tech E com "e-mail automático" ligado.
+   --------------------------------------------------------------------- */
+function htmlDoTexto(t) {
+  const e = String(t || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/(https?:\/\/[^\s)]+)/g, '<a href="$1">$1</a>').replace(/\n/g, "<br>");
+  return '<div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.5;color:#0f172a;max-width:600px">' + e + "</div>";
+}
+export async function enviarCobrancasEmail({ servico, env, fetchFn, cobrancaId = null, escritorioId = null }) {
+  const key = env.RESEND_API_KEY, rem = String(env.CINTIA_EMAIL_REMETENTE || "").trim();
+  if (!key || !rem) return { ok: false, erro: "O e-mail ainda não foi configurado (faltam RESEND_API_KEY e CINTIA_EMAIL_REMETENTE nos segredos da função)." };
+  const lib = await servico.from("cintia_liberacoes").select("escritorio_id").eq("liberada", true);
+  let ids = (lib.data || []).map((x) => x.escritorio_id);
+  if (escritorioId) ids = ids.filter((x) => x === escritorioId);
+  if (!ids.length) return { ok: true, enviados: 0, erros: [] };
+  let qe = servico.from("escritorios").select("id, nome, email, cobranca_email_auto").in("id", ids);
+  const escs = (await qe).data || [];
+  const porId = Object.fromEntries(escs.map((e) => [e.id, e]));
+  let q = servico.from("cobrancas").select("id, escritorio_id, assunto, mensagem, email_destino").eq("status", "ABERTA").not("email_destino", "is", null);
+  if (cobrancaId) q = q.eq("id", cobrancaId);
+  else {
+    const auto = escs.filter((e) => e.cobranca_email_auto).map((e) => e.id);
+    if (!auto.length) return { ok: true, enviados: 0, erros: [] };
+    q = q.in("escritorio_id", auto).is("email_status", null).gte("criado_em", new Date(Date.now() - 3 * 86400000).toISOString()).limit(80);
+  }
+  const lista = (await q).data || [];
+  let enviados = 0; const erros = [];
+  for (const cb of lista) {
+    const esc = porId[cb.escritorio_id] || {};
+    const from = rem.includes("<") ? rem : (String(esc.nome || "Escritório contábil").replace(/[<>"]/g, "") + " <" + rem + ">");
+    const corpo = { from, to: [cb.email_destino], subject: cb.assunto, text: cb.mensagem, html: htmlDoTexto(cb.mensagem) };
+    if (esc.email) corpo.reply_to = esc.email;
+    let ok = false, erro = "";
+    try {
+      const r = await fetchFn("https://api.resend.com/emails", { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + key }, body: JSON.stringify(corpo) });
+      ok = r.ok;
+      if (!ok) { let j = {}; try { j = await r.json(); } catch (_) {} erro = String(j.message || j.error || ("HTTP " + r.status)).slice(0, 300); }
+    } catch (e) { erro = String(e && e.message || e).slice(0, 300); }
+    await servico.from("cobrancas").update({ email_status: ok ? "ENVIADO" : "ERRO", email_erro: ok ? null : erro, email_em: new Date().toISOString(), atualizado_em: new Date().toISOString() }).eq("id", cb.id);
+    if (ok) enviados++; else erros.push("E-mail para " + cb.email_destino + ": " + erro);
+  }
+  return { ok: true, enviados, erros };
+}
+
+/* ---------------------------------------------------------------------
+   Entrada da função
+   --------------------------------------------------------------------- */
+export async function tratar(req, env, criarCliente, fetchFn) {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
+  if (req.method !== "POST") return resposta({ erro: "Use POST." }, 405);
+  /* chamada agendada do próprio banco (8h, dias úteis): manda os e-mails de cobrança */
+  const chaveCron = req.headers.get("x-cintia-cron");
+  if (chaveCron) {
+    const srv = criarCliente(env.SUPABASE_URL, chave(env, "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SECRET_KEYS"), { auth: { persistSession: false, autoRefreshToken: false } });
+    const ok = await srv.rpc("cintia_cron_confere", { p_chave: chaveCron });
+    if (ok.error || ok.data !== true) return resposta({ erro: "Chave inválida." }, 401);
+    return resposta(await enviarCobrancasEmail({ servico: srv, env, fetchFn }));
+  }
+  const auth = req.headers.get("Authorization") || "";
+  if (!auth.startsWith("Bearer ")) return resposta({ erro: "Faça login." }, 401);
+  const db = criarCliente(env.SUPABASE_URL, chave(env, "SUPABASE_ANON_KEY", "SUPABASE_PUBLISHABLE_KEYS"), {
+    global: { headers: { Authorization: auth } }, auth: { persistSession: false, autoRefreshToken: false } });
+  const servico = criarCliente(env.SUPABASE_URL, chave(env, "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SECRET_KEYS"), { auth: { persistSession: false, autoRefreshToken: false } });
+  const eu = await db.auth.getUser(auth.slice(7));
+  if (eu.error || !eu.data || !eu.data.user) return resposta({ erro: "Sessão expirada. Entre de novo." }, 401);
+  const userId = eu.data.user.id;
+
+  let c; try { c = await req.json(); } catch (_) { return resposta({ erro: "Pedido inválido." }, 400); }
+  const pergunta = String(c.pergunta || "").trim().slice(0, 4000), escritorio = String(c.escritorio_id || "");
+  const historico = (Array.isArray(c.historico) ? c.historico : []).slice(-8).map((m) => ({ papel: m.papel === "cintia" ? "cintia" : "voce", texto: String(m.texto || "").slice(0, 4000) }));
+  if (c.acao === "status") {
+    const membro = await db.rpc("is_membro", { p_escritorio: escritorio });
+    if (membro.error || membro.data !== true) return resposta({ erro: "Sem acesso a este escritório." }, 403);
+    const m = criarModelo(env, fetchFn);
+    const cfg = await lerConfig(db, escritorio, env);
+    const uso = await db.rpc("cintia_consumo_mes", { p_escritorio: escritorio });
+    return resposta({ ok: true, liberada: cfg.liberada, configurada: !!m, email_configurado: !!(env.RESEND_API_KEY && env.CINTIA_EMAIL_REMETENTE), provedor: m ? m.provedor : null, modelo: m ? m.modelo : null, tokens_mes: Number(uso.data || 0), limite_mes: cfg.limite });
+  }
+  /* "Enviar e-mail agora" de uma cobrança, pela tela de Cobranças */
+  if (c.acao === "enviar_cobranca_email") {
+    const membroE = await db.rpc("is_membro", { p_escritorio: escritorio });
+    if (membroE.error || membroE.data !== true) return resposta({ erro: "Sem acesso a este escritório." }, 403);
+    const cfgE = await lerConfig(db, escritorio, env);
+    if (!cfgE.liberada) return resposta({ erro: "O envio de e-mails da Cint.IA não está liberado para este escritório. Fale com a CGL Tech." }, 403);
+    const cob = await db.from("cobrancas").select("id").eq("id", String(c.cobranca_id || "")).eq("escritorio_id", escritorio).maybeSingle();
+    if (!cob.data) return resposta({ erro: "Cobrança não encontrada." }, 404);
+    const r = await enviarCobrancasEmail({ servico, env, fetchFn, cobrancaId: cob.data.id, escritorioId: escritorio });
+    if (!r.ok) return resposta({ erro: r.erro || "Não foi possível enviar." }, 502);
+    if (r.erros && r.erros.length) return resposta({ erro: r.erros[0] }, 502);
+    if (!r.enviados) return resposta({ erro: "Esta cobrança não tem e-mail do cliente cadastrado." }, 400);
+    return resposta({ ok: true, enviados: r.enviados });
+  }
+  /* Notificação contratual por e-mail, com o PDF anexado */
+  if (c.acao === "enviar_notificacao_email") {
+    const membroN = await db.rpc("is_membro", { p_escritorio: escritorio });
+    if (membroN.error || membroN.data !== true) return resposta({ erro: "Sem acesso a este escritório." }, 403);
+    const cfgN = await lerConfig(db, escritorio, env);
+    if (!cfgN.liberada) return resposta({ erro: "O envio de e-mails pela Cint.IA não está liberado para este escritório. Fale com a CGL Tech." }, 403);
+    const key = env.RESEND_API_KEY, rem = String(env.CINTIA_EMAIL_REMETENTE || "").trim();
+    if (!key || !rem) return resposta({ erro: "O e-mail ainda não foi configurado (faltam RESEND_API_KEY e CINTIA_EMAIL_REMETENTE nos segredos da função)." }, 502);
+    const n = (await db.from("notificacoes").select("id, numero, titulo, texto, email_destino, destinatario, status").eq("id", String(c.notificacao_id || "")).eq("escritorio_id", escritorio).maybeSingle()).data;
+    if (!n) return resposta({ erro: "Notificação não encontrada." }, 404);
+    if (n.status !== "EMITIDA") return resposta({ erro: "Esta notificação foi cancelada." }, 400);
+    const para = String(c.email || n.email_destino || "").trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(para)) return resposta({ erro: "O cliente não tem e-mail válido cadastrado." }, 400);
+    const pdf = String(c.pdf_base64 || "").replace(/^data:[^,]*,/, "");
+    if (pdf.length > 6000000) return resposta({ erro: "PDF grande demais para anexar." }, 400);
+    const esc = (await servico.from("escritorios").select("nome, email").eq("id", escritorio).maybeSingle()).data || {};
+    const from = rem.includes("<") ? rem : (String(esc.nome || "Escritório contábil").replace(/[<>"]/g, "") + " <" + rem + ">");
+    const corpo = "Prezado(a) " + (n.destinatario || "cliente") + ",\n\nSegue a " + n.titulo + " nº " + n.numero + " (também em PDF, anexo).\n" +
+      "Você pode ler e registrar a ciência pelo Portal do Cliente.\n\n---------------------------------------------\n\n" + n.texto;
+    const msg = { from, to: [para], subject: n.titulo + " nº " + n.numero + " — " + (esc.nome || ""), text: corpo, html: htmlDoTexto(corpo) };
+    if (esc.email) { msg.reply_to = esc.email; msg.cc = [esc.email]; }
+    if (pdf) msg.attachments = [{ filename: "Notificacao_" + n.numero.replace("/", "-") + ".pdf", content: pdf }];
+    let ok = false, erro = "";
+    try {
+      const r = await fetchFn("https://api.resend.com/emails", { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + key }, body: JSON.stringify(msg) });
+      ok = r.ok; if (!ok) { let j = {}; try { j = await r.json(); } catch (_) {} erro = String(j.message || j.error || ("HTTP " + r.status)).slice(0, 300); }
+    } catch (e) { erro = String(e && e.message || e).slice(0, 300); }
+    await servico.from("notificacoes").update({ email_status: ok ? "ENVIADO" : "ERRO", email_erro: ok ? null : erro, email_em: new Date().toISOString(), email_destino: para }).eq("id", n.id);
+    if (!ok) return resposta({ erro: "O e-mail não foi enviado: " + erro }, 502);
+    return resposta({ ok: true, enviado_para: para });
+  }
+  if (pergunta.length < 2) return resposta({ erro: "Escreva a sua pergunta." }, 400);
+
+  /* só membros do escritório (equipe); clientes do Portal não usam a Cint.IA */
+  const membro = await db.rpc("is_membro", { p_escritorio: escritorio });
+  if (membro.error || membro.data !== true) return resposta({ erro: "A Cint.IA é só para a equipe do escritório." }, 403);
+  /* a conversa com IA só funciona em escritório liberado pela CGL Tech */
+  const cfg = await lerConfig(db, escritorio, env);
+  if (!cfg.liberada) return resposta({ erro: "A conversa com a Cint.IA ainda não está liberada para este escritório. Fale com a CGL Tech." }, 403);
+  const forn = await db.rpc("is_fornecedor");
+  if (!(forn.data === true)) {
+    const sit = await db.rpc("situacao_efetiva", { p_escritorio: escritorio });
+    if (!sit.error && SITUACOES_SEM_IA.includes(sit.data)) return resposta({ erro: "A Cint.IA está pausada porque a assinatura do escritório não está ativa." }, 402);
+  }
+  /* teto de consumo do mês (protege a conta de surpresa) */
+  const limite = cfg.limite;
+  const consumo = await db.rpc("cintia_consumo_mes", { p_escritorio: escritorio });
+  if (!consumo.error && Number(consumo.data || 0) >= limite) return resposta({ erro: "O escritório atingiu o limite de uso da Cint.IA neste mês." }, 429);
+  /* no máximo 20 perguntas por minuto por pessoa */
+  const recentes = await servico.from("cintia_conversas").select("id", { count: "exact", head: true }).eq("user_id", userId).gte("criado_em", new Date(Date.now() - 60000).toISOString());
+  if ((recentes.count || 0) >= 20) return resposta({ erro: "Muitas perguntas seguidas. Aguarde um minuto." }, 429);
+
+  const modelo = criarModelo(env, fetchFn);
+  if (!modelo) return resposta({ erro: "A Cint.IA ainda não foi configurada (falta escolher o modelo e a chave nos segredos da função)." }, 503);
+  const esc = await db.from("escritorios").select("nome").eq("id", escritorio).maybeSingle();
+  const ctx = { hoje: hojeBR(), escritorio: esc.data && esc.data.nome };
+
+  let r;
+  try { r = await executarAgente({ modelo, db, pergunta, historico, ctx }); }
+  catch (e) {
+    const msg = String(e && e.message || e);
+    if (/credit balance|insufficient_quota|billing|quota/i.test(msg)) return resposta({ erro: "A conta da IA está sem saldo. Adicione crédito no painel do fornecedor (Anthropic: platform.claude.com › Adicionar saldo) e tente de novo." }, 402);
+    if (/invalid x-api-key|authentication|api key|401/i.test(msg)) return resposta({ erro: "A chave da IA não foi aceita. Confira o segredo CINTIA_CHAVE no Supabase." }, 502);
+    if (/model/i.test(msg) && /not.?found|does not exist|404/i.test(msg)) return resposta({ erro: "O modelo informado em CINTIA_MODELO não existe neste fornecedor. Confira o nome no Supabase." }, 502);
+    return resposta({ erro: "A Cint.IA não conseguiu responder agora: " + msg.slice(0, 200) }, 502);
+  }
+
+  const reg = await servico.from("cintia_conversas").insert({ escritorio_id: escritorio, user_id: userId, pergunta, resposta: r.texto, ferramentas: r.ferramentas,
+    provedor: modelo.provedor, modelo: modelo.modelo, tokens_entrada: r.uso.entrada, tokens_saida: r.uso.saida }).select("id").maybeSingle();
+  return resposta({ ok: true, id: reg.data && reg.data.id, resposta: r.texto, ferramentas: r.ferramentas.map((f) => f.nome), uso: r.uso });
+}
+
+if (typeof Deno !== "undefined") {
+  const { createClient } = await import("npm:@supabase/supabase-js@2.45.4");
+  Deno.serve((req) => tratar(req, Deno.env.toObject(), createClient, fetch));
+}
