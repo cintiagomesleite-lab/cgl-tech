@@ -1,0 +1,16 @@
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+
+/
+  Cache-Control: no-cache
+/index.html
+  Cache-Control: no-cache
+/version.json
+  Cache-Control: no-store
+/portal/
+  Cache-Control: no-cache
+/portal/index.html
+  Cache-Control: no-cache
