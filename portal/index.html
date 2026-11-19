@@ -322,16 +322,18 @@ function htmlNotificacoes(e){
   return '<div class="card" style="border-left:4px solid '+(pend? "#dc2626" : "var(--ink-soft)")+';"><h2>📄 Notificações do escritório</h2>' +
     '<div class="sub">'+(pend? "Leia com atenção e confirme a leitura" : "Comunicados formais do escritório")+'</div>' +
     l.map(function(n){
+      var termo = n.tipo==="TERMO_RESCISAO" || n.tipo==="CONTRATO", pal = termo? "aceite" : "ciência", oque = n.tipo==="CONTRATO"? "o contrato" : "o termo";
       return '<details class="notif"'+(n.ciente_em? "" : " open")+'><summary><strong>'+esc(n.titulo)+' nº '+esc(n.numero)+'</strong>' +
-        (n.ciente_em? '<span class="tag ok">Ciência em '+fmtData(n.ciente_em)+'</span>' : '<span class="tag danger">Aguardando sua ciência</span>') +
+        (n.ciente_em? '<span class="tag ok">'+(termo? "Aceito" : "Ciência")+' em '+fmtData(n.ciente_em)+'</span>' : '<span class="tag danger">Aguardando seu '+pal+'</span>') +
         '<div class="d">Emitida em '+fmtData(n.emitida_em)+(n.prazo_ate? ' · prazo até '+fmtData(n.prazo_ate) : '')+(n.efeito_em? ' · a partir de '+fmtData(n.efeito_em) : '')+'</div></summary>' +
         '<div class="notif-texto" id="nt-'+esc(n.id)+'">'+esc(n.texto)+'<div class="notif-cod">Código de verificação: '+esc(String(n.codigo||"").slice(0,32))+'</div></div>' +
         '<div class="notif-acoes"><button class="btn leve peq" data-nt-imprimir="'+esc(n.id)+'">Imprimir / salvar PDF</button></div>' +
-        (n.ciente_em? '<div class="d" style="margin-top:6px;">Ciência registrada por '+esc(n.ciente_nome||"")+' em '+new Date(n.ciente_em).toLocaleString("pt-BR")+'.</div>'
-          : '<div class="notif-ciencia"><label for="ntn-'+esc(n.id)+'">Para confirmar que leu, digite seu nome completo:</label>' +
+        (n.ciente_em? '<div class="d" style="margin-top:6px;">'+(termo? "Aceite" : "Ciência")+' registrado por '+esc(n.ciente_nome||"")+' em '+new Date(n.ciente_em).toLocaleString("pt-BR")+'.</div>'
+          : '<div class="notif-ciencia"><label for="ntn-'+esc(n.id)+'">'+(termo? "Para aceitar "+oque+", digite seu nome completo:" : "Para confirmar que leu, digite seu nome completo:")+'</label>' +
             '<input class="campo" id="ntn-'+esc(n.id)+'" maxlength="200" placeholder="Seu nome completo">' +
-            '<button class="btn pri" style="width:100%;margin-top:8px;" data-nt-ciente="'+esc(n.id)+'">Li e estou ciente</button>' +
-            '<div class="d" style="margin-top:6px;">A confirmação registra a data, a hora e o endereço de internet (IP). Ela indica que você leu o comunicado; não significa concordância com o conteúdo.</div></div>') +
+            '<button class="btn pri" style="width:100%;margin-top:8px;" data-nt-ciente="'+esc(n.id)+'" data-nt-termo="'+(termo? "1" : "")+'">'+(termo? "Li e aceito "+oque : "Li e estou ciente")+'</button>' +
+            '<div class="d" style="margin-top:6px;">'+(termo? "O aceite registra seu nome, a data, a hora e o endereço de internet (IP) e vale como sua concordância com "+oque+". Se preferir, assine também o PDF enviado pelo escritório." :
+              "A confirmação registra a data, a hora e o endereço de internet (IP). Ela indica que você leu o comunicado; não significa concordância com o conteúdo.")+'</div></div>') +
         '</details>';
     }).join("") + '</div>';
 }
@@ -342,7 +344,7 @@ function ligarNotificacoes(){
     b.disabled = true; b.textContent = "Registrando…";
     var r = await sb.rpc("portal_dar_ciencia", {p_id:id, p_nome:nome});
     if(r.error){ b.disabled = false; b.textContent = "Li e estou ciente"; return toast(traduz(r.error)); }
-    toast("Ciência registrada. Obrigado!"); carregar();
+    toast(b.getAttribute("data-nt-termo")? "Aceite registrado. Obrigado!" : "Ciência registrada. Obrigado!"); carregar();
   }; });
   Array.prototype.forEach.call(document.querySelectorAll("[data-nt-imprimir]"), function(b){ b.onclick = function(){
     var el = document.getElementById("nt-"+b.getAttribute("data-nt-imprimir")); if(!el) return;
