@@ -1,1 +1,1 @@
-{"versao": "7dbff49633a2", "novidades": "Editar contratos e notificações (correção no mesmo número ou nova versão)"}
+{"versao": "66fe1a10d29c", "novidades": "Leitura de DANFE em PDF mais robusta (chave com espaços, PDF sem texto: usa a chave do nome do arquivo)"}
