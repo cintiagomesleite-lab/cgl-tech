@@ -95,6 +95,23 @@ select.campo,textarea.campo{width:100%;padding:11px;border:1px solid var(--line)
 .notif-acoes{margin-top:8px}
 .notif .d{font-size:.8rem;color:#64748b;font-weight:400}
 .notif-ciencia{margin-top:10px;padding:10px;border:1px solid #fecaca;background:#fef2f2;border-radius:8px}
+.ecal{margin-top:10px;border:1px solid #e5e7eb;border-radius:12px;padding:10px}
+.ecal-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+.ecal-nav{border:0;background:#f1f5f9;border-radius:8px;width:34px;height:30px;font-size:1.1rem;cursor:pointer}
+.ecal-nav[disabled]{opacity:.3;cursor:default}
+.ecal-g{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;text-align:center}
+.ecal-g b{font-size:.7rem;color:#64748b;font-weight:600}
+.ecal-d{position:relative;border:0;background:none;height:34px;border-radius:8px;font-size:.85rem;color:#334155}
+.ecal-d[disabled]{cursor:default}
+.ecal-d.hoje{outline:2px solid #0b1f3a}
+.ecal-d.tem{background:#f59e0b;color:#fff;font-weight:700;cursor:pointer}
+.ecal-d.atraso{background:#dc2626;color:#fff;font-weight:700;cursor:pointer}
+.ecal-d.ok{background:#059669;color:#fff;font-weight:700;cursor:pointer}
+.ecal-d.sel{box-shadow:0 0 0 3px #c9a227}
+.ecal-d i{position:absolute;top:-4px;right:-2px;background:#0b1f3a;color:#fff;font-style:normal;font-size:.6rem;border-radius:9px;padding:0 4px}
+.ecal-leg{display:flex;gap:12px;flex-wrap:wrap;font-size:.72rem;color:#64748b;margin-top:8px}
+.ecal-leg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:4px;vertical-align:middle}
+.ecal-leg i.tem{background:#f59e0b}.ecal-leg i.atraso{background:#dc2626}.ecal-leg i.ok{background:#059669}
 </style>
 </head>
 <body>
@@ -277,7 +294,7 @@ function desenhar(){
   app.innerHTML =
     '<div class="ola"><div class="card"><h1>Olá'+(nome? ", "+esc(nome) : "")+'! 👋</h1><div class="emp">'+esc(e.nome_fantasia||e.razao_social)+' · CNPJ '+fmtCNPJ(e.cnpj)+'</div>' +
       (emps.length>1? '<select class="emp-sel" id="selEmp">'+emps.map(function(x){ return '<option value="'+x.id+'"'+(x.id===e.id?" selected":"")+'>'+esc(x.nome_fantasia||x.razao_social)+'</option>'; }).join("")+'</select>' : '') + '</div></div>' +
-    htmlNotificacoes(e) + htmlPendenciasMes(e, abertas) + htmlMovimento(e) +
+    htmlNotificacoes(e) + htmlPendenciasMes(e, abertas) + htmlEntregas(e) + htmlMovimento(e) +
     (pend.length? '<div class="card" style="border-left:4px solid var(--gold);"><h2>📋 O escritório precisa de você</h2><div class="sub">Envie aqui embaixo, em "Enviar documentos", ou pelo WhatsApp</div>'+htmlPend+'</div>' : '') +
     htmlPedido(e) + htmlEnvio(e) +
     '<div class="card"><h2>📅 Vencimentos</h2><div class="sub">Guias e obrigações da sua empresa</div>'+htmlObr+'</div>' +
@@ -289,10 +306,11 @@ function desenhar(){
     '<div class="rodape">Atualizado em '+new Date().toLocaleString("pt-BR",{dateStyle:"short",timeStyle:"short"})+' · <a href="#" id="aRecarregar" style="color:inherit;">atualizar</a> · <a href="#" id="aSenha" style="color:inherit;">trocar senha</a></div>';
 
   var se = document.getElementById("selEmp"); if(se) se.onchange = function(){ empSel = se.value; envFila = []; desenhar(); window.scrollTo(0,0); };
-  ligarEnvio(e); ligarPedido(e); ligarNotificacoes();
+  ligarEnvio(e); ligarPedido(e); ligarNotificacoes(); ligarEntregas();
   Array.prototype.forEach.call(document.querySelectorAll("[data-enviar-doc]"), function(b){ b.onclick = function(){
     envCatSel = DOC_PARA_CAT[b.getAttribute("data-enviar-doc")] || "";
     var cat = document.getElementById("envCat"); if(cat && envCatSel) cat.value = envCatSel;
+    var mesEl = document.getElementById("envMes"), cp = b.getAttribute("data-comp"); if(mesEl && cp) mesEl.value = cp;
     var dr = document.getElementById("envDrop"); if(dr) dr.scrollIntoView({behavior:"smooth", block:"center"});
     var inp = document.getElementById("envInp"); if(inp) inp.click();
   }; });
@@ -381,7 +399,56 @@ function htmlMovimento(e){
     limite + '</div>';
 }
 /* ---------- pendências com o escritório (documentos do mês + honorário em atraso) ---------- */
+/* ---------- calendário de entregas: o que mandar ao escritório e até quando ---------- */
+var ENT_MOTIVO = {NOTAS_VENDA:"para apurar o imposto do mês com tempo de conferir", NOTAS_COMPRA:"para lançar as compras e conferir o imposto",
+  FOLHA:"para calcular e conferir a folha antes do pagamento dos salários", EXTRATO:"para conciliar o banco e fechar a contabilidade",
+  DESPESAS:"para lançar as despesas na contabilidade", OUTROS:"para concluir o fechamento do mês"};
+var DIAS_SEM = ["dom","seg","ter","qua","qui","sex","sáb"];
+function entregasDe(e){ return dados.entregas? dados.entregas.filter(function(x){ return x.empresa_id===e.id; }) : null; }
+var entMesSel = "", entDiaSel = "";
+function htmlEntregas(e){
+  var l = entregasDe(e); if(!l || !l.length) return "";
+  var h = hoje(), meses = {}; l.forEach(function(x){ meses[x.prazo.slice(0,7)] = true; });
+  var lista = Object.keys(meses).sort(), ym = entMesSel && meses[entMesSel]? entMesSel : (meses[h.slice(0,7)]? h.slice(0,7) : lista[lista.length-1]);
+  var iM = lista.indexOf(ym), a = Number(ym.slice(0,4)), m = Number(ym.slice(5,7));
+  var doMes = l.filter(function(x){ return x.prazo.slice(0,7)===ym; }), porDia = {};
+  doMes.forEach(function(x){ (porDia[x.prazo] = porDia[x.prazo]||[]).push(x); });
+  var ini = new Date(a, m-1, 1), cel = "";
+  for(var k=0; k<ini.getDay(); k++) cel += '<span></span>';
+  var ult = new Date(a, m, 0).getDate();
+  for(var dd=1; dd<=ult; dd++){
+    var iso = ym+"-"+String(dd).padStart(2,"0"), it = porDia[iso]||[], cls = "ecal-d"+(iso===h? " hoje" : "")+(iso===entDiaSel? " sel" : "");
+    if(it.length){ var falta = it.filter(function(x){ return !x.recebido; }); cls += !falta.length? " ok" : iso<h? " atraso" : " tem"; }
+    cel += '<button class="'+cls+'"'+(it.length? ' data-ecal-dia="'+iso+'"' : ' disabled')+'>'+dd+(it.length>1? '<i>'+it.length+'</i>' : '')+'</button>';
+  }
+  var sel = entDiaSel && entDiaSel.slice(0,7)===ym? doMes.filter(function(x){ return x.prazo===entDiaSel; }) : doMes;
+  var grupos = {}; sel.forEach(function(x){ (grupos[x.prazo] = grupos[x.prazo]||[]).push(x); });
+  var itens = Object.keys(grupos).sort().map(function(k2){
+    var dias = Math.round((Date.parse(k2+"T12:00:00") - Date.parse(h+"T12:00:00"))/864e5);
+    return '<div style="margin-top:10px;"><div style="font-weight:700;font-size:.85rem;color:#0b1f3a;">'+fmtData(k2)+' ('+DIAS_SEM[new Date(k2+"T12:00:00").getDay()]+')' +
+      (dias===0? ' <span class="tag warn">hoje</span>' : dias>0 && dias<=3? ' <span class="tag warn">em '+dias+' dia'+(dias>1?"s":"")+'</span>' : '')+'</div>' +
+      grupos[k2].map(function(x){
+        var st = x.recebido? '<span class="tag ok">Recebido ✓</span>' : x.prazo<h? '<span class="tag danger">Atrasado</span>' : '';
+        return '<div class="item"><div class="main"><div class="t" style="font-weight:500;">'+esc(x.nome)+' de '+esc(compLabel(x.competencia).toLowerCase())+st+'</div>' +
+          '<div class="d">'+esc(ENT_MOTIVO[x.codigo]||"")+(x.prazo_escritorio? '. Nosso prazo final: '+esc(x.ref||"")+' em '+fmtData(x.prazo_escritorio) : '')+'</div></div>' +
+          (x.recebido? '' : '<button class="btn leve peq" data-enviar-doc="'+esc(x.codigo)+'" data-comp="'+esc(String(x.competencia).slice(0,7))+'">Enviar</button>')+'</div>';
+      }).join("") + '</div>';
+  }).join("");
+  return '<div class="card"><h2>📅 Calendário de entregas</h2><div class="sub">Até quando mandar cada documento ao escritório. O seu prazo vem sempre alguns dias antes do nosso, para dar tempo de lançar e conferir tudo antes dos vencimentos.</div>' +
+    '<div class="ecal"><div class="ecal-top"><button class="ecal-nav" data-ecal-mes="'+(lista[iM-1]||"")+'"'+(iM>0? "" : " disabled")+'>‹</button><strong>'+MESES_LONGO[m-1]+' '+a+'</strong><button class="ecal-nav" data-ecal-mes="'+(lista[iM+1]||"")+'"'+(iM<lista.length-1? "" : " disabled")+'>›</button></div>' +
+      '<div class="ecal-g">'+["D","S","T","Q","Q","S","S"].map(function(x){ return '<b>'+x+'</b>'; }).join("")+cel+'</div>' +
+      '<div class="ecal-leg"><span><i class="tem"></i>Enviar até</span><span><i class="atraso"></i>Atrasado</span><span><i class="ok"></i>Recebido</span></div></div>' +
+    (entDiaSel? '<div style="margin-top:6px;"><a href="#" id="ecalTodos" style="font-size:.82rem;">ver o mês todo</a></div>' : '') +
+    (itens || '<div class="d" style="margin-top:8px;">Nenhuma entrega neste mês.</div>') + '</div>';
+}
+function ligarEntregas(){
+  Array.prototype.forEach.call(document.querySelectorAll("[data-ecal-mes]"), function(b){ b.onclick = function(){ var v = b.getAttribute("data-ecal-mes"); if(v){ entMesSel = v; entDiaSel = ""; desenhar(); } }; });
+  Array.prototype.forEach.call(document.querySelectorAll("[data-ecal-dia]"), function(b){ b.onclick = function(){ var v = b.getAttribute("data-ecal-dia"); entDiaSel = entDiaSel===v? "" : v; entMesSel = v.slice(0,7); desenhar(); }; });
+  var t = document.getElementById("ecalTodos"); if(t) t.onclick = function(ev){ ev.preventDefault(); entDiaSel = ""; desenhar(); };
+}
 function htmlPendenciasMes(e, abertas){
+  var ent = entregasDe(e);
+  if(ent) return htmlPendenciasEntregas(e, abertas, ent);
   var h = hoje(), dm = (dados.docs_mes||[]).find(function(x){ return x.empresa_id===e.id; });
   var atrasados = (abertas||[]).filter(function(x){ return x.vencimento<h; });
   var faltam = dm? (dm.docs||[]).filter(function(x){ return !x.recebido; }) : [];
@@ -396,6 +463,22 @@ function htmlPendenciasMes(e, abertas){
   return '<div class="card" style="border-left:4px solid '+(pend? (passou||atrasados.length? "#dc2626" : "var(--gold)") : "#059669")+';">' +
     '<h2>'+(pend? "⚠️ Pendências com o escritório" : "✅ Tudo em dia com o escritório")+'</h2>' +
     (dm? '<div class="sub">Documentos de '+esc(compLabel(dm.competencia))+' — prazo: '+fmtData(dm.dia_limite)+(faltam.length? '' : ' · todos recebidos, obrigado!')+'</div>'+linhasDoc : '') +
+    (atrasados.length? '<div class="item"><div class="main"><div class="t">Honorário em atraso<span class="tag danger">'+atrasados.length+'</span></div><div class="d">Veja os detalhes e o Pix em “Honorários”, mais abaixo</div></div><div class="v">'+fmtMoeda(tot)+'</div></div>' : '') +
+    '</div>';
+}
+/* pendências com o calendário de entregas: o que já passou do prazo e não chegou */
+function htmlPendenciasEntregas(e, abertas, ent){
+  var h = hoje(), atrasados = (abertas||[]).filter(function(x){ return x.vencimento<h; });
+  var late = ent.filter(function(x){ return !x.recebido && x.prazo<h; });
+  var tot = atrasados.reduce(function(s, x){ return s+Number(x.valor||0); }, 0);
+  if(!ent.length && !atrasados.length) return "";
+  var pend = late.length || atrasados.length;
+  return '<div class="card" style="border-left:4px solid '+(pend? "#dc2626" : "#059669")+';">' +
+    '<h2>'+(pend? "⚠️ Pendências com o escritório" : "✅ Tudo em dia com o escritório")+'</h2>' +
+    (late.length? '<div class="sub">Documentos com o prazo vencido</div>' + late.map(function(x){
+      return '<div class="item"><div class="main"><div class="t" style="font-weight:500;">'+esc(x.nome)+' de '+esc(compLabel(x.competencia).toLowerCase())+'<span class="tag danger">Atrasado</span></div><div class="d">Prazo era '+fmtData(x.prazo)+'</div></div>' +
+        '<button class="btn leve peq" data-enviar-doc="'+esc(x.codigo)+'" data-comp="'+esc(String(x.competencia).slice(0,7))+'">Enviar</button></div>'; }).join("") :
+      (ent.length? '<div class="sub">Nenhum documento atrasado. Obrigado!</div>' : '')) +
     (atrasados.length? '<div class="item"><div class="main"><div class="t">Honorário em atraso<span class="tag danger">'+atrasados.length+'</span></div><div class="d">Veja os detalhes e o Pix em “Honorários”, mais abaixo</div></div><div class="v">'+fmtMoeda(tot)+'</div></div>' : '') +
     '</div>';
 }
