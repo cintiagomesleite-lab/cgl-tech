@@ -277,7 +277,7 @@ function desenhar(){
   app.innerHTML =
     '<div class="ola"><div class="card"><h1>Olá'+(nome? ", "+esc(nome) : "")+'! 👋</h1><div class="emp">'+esc(e.nome_fantasia||e.razao_social)+' · CNPJ '+fmtCNPJ(e.cnpj)+'</div>' +
       (emps.length>1? '<select class="emp-sel" id="selEmp">'+emps.map(function(x){ return '<option value="'+x.id+'"'+(x.id===e.id?" selected":"")+'>'+esc(x.nome_fantasia||x.razao_social)+'</option>'; }).join("")+'</select>' : '') + '</div></div>' +
-    htmlNotificacoes(e) + htmlPendenciasMes(e, abertas) +
+    htmlNotificacoes(e) + htmlPendenciasMes(e, abertas) + htmlMovimento(e) +
     (pend.length? '<div class="card" style="border-left:4px solid var(--gold);"><h2>📋 O escritório precisa de você</h2><div class="sub">Envie aqui embaixo, em "Enviar documentos", ou pelo WhatsApp</div>'+htmlPend+'</div>' : '') +
     htmlPedido(e) + htmlEnvio(e) +
     '<div class="card"><h2>📅 Vencimentos</h2><div class="sub">Guias e obrigações da sua empresa</div>'+htmlObr+'</div>' +
@@ -319,19 +319,19 @@ function htmlNotificacoes(e){
   var l = (dados.notificacoes||[]).filter(function(n){ return n.empresa_id===e.id; });
   if(!l.length) return "";
   var pend = l.filter(function(n){ return !n.ciente_em; }).length;
-  return '<div class="card" style="border-left:4px solid '+(pend? "#dc2626" : "var(--ink-soft)")+';"><h2>📄 Notificações do escritório</h2>' +
+  return '<div class="card" style="border-left:4px solid '+(pend? "#dc2626" : "var(--ink-soft)")+';"><h2>📄 Contratos e comunicados do escritório</h2>' +
     '<div class="sub">'+(pend? "Leia com atenção e confirme a leitura" : "Comunicados formais do escritório")+'</div>' +
     l.map(function(n){
-      var termo = n.tipo==="TERMO_RESCISAO" || n.tipo==="CONTRATO", pal = termo? "aceite" : "ciência", oque = n.tipo==="CONTRATO"? "o contrato" : "o termo";
+      var carta = n.tipo==="CARTA_RESPONSABILIDADE", termo = n.tipo==="TERMO_RESCISAO" || n.tipo==="CONTRATO" || carta, pal = termo? "aceite" : "ciência", oque = n.tipo==="CONTRATO"? "o contrato" : carta? "a carta" : "o termo";
       return '<details class="notif"'+(n.ciente_em? "" : " open")+'><summary><strong>'+esc(n.titulo)+' nº '+esc(n.numero)+'</strong>' +
         (n.ciente_em? '<span class="tag ok">'+(termo? "Aceito" : "Ciência")+' em '+fmtData(n.ciente_em)+'</span>' : '<span class="tag danger">Aguardando seu '+pal+'</span>') +
         '<div class="d">Emitida em '+fmtData(n.emitida_em)+(n.prazo_ate? ' · prazo até '+fmtData(n.prazo_ate) : '')+(n.efeito_em? ' · a partir de '+fmtData(n.efeito_em) : '')+'</div></summary>' +
         '<div class="notif-texto" id="nt-'+esc(n.id)+'">'+esc(n.texto)+'<div class="notif-cod">Código de verificação: '+esc(String(n.codigo||"").slice(0,32))+'</div></div>' +
         '<div class="notif-acoes"><button class="btn leve peq" data-nt-imprimir="'+esc(n.id)+'">Imprimir / salvar PDF</button></div>' +
         (n.ciente_em? '<div class="d" style="margin-top:6px;">'+(termo? "Aceite" : "Ciência")+' registrado por '+esc(n.ciente_nome||"")+' em '+new Date(n.ciente_em).toLocaleString("pt-BR")+'.</div>'
-          : '<div class="notif-ciencia"><label for="ntn-'+esc(n.id)+'">'+(termo? "Para aceitar "+oque+", digite seu nome completo:" : "Para confirmar que leu, digite seu nome completo:")+'</label>' +
+          : '<div class="notif-ciencia"><label for="ntn-'+esc(n.id)+'">'+(carta? "Para assinar a carta, digite o nome completo do(a) administrador(a):" : termo? "Para aceitar "+oque+", digite seu nome completo:" : "Para confirmar que leu, digite seu nome completo:")+'</label>' +
             '<input class="campo" id="ntn-'+esc(n.id)+'" maxlength="200" placeholder="Seu nome completo">' +
-            '<button class="btn pri" style="width:100%;margin-top:8px;" data-nt-ciente="'+esc(n.id)+'" data-nt-termo="'+(termo? "1" : "")+'">'+(termo? "Li e aceito "+oque : "Li e estou ciente")+'</button>' +
+            '<button class="btn pri" style="width:100%;margin-top:8px;" data-nt-ciente="'+esc(n.id)+'" data-nt-termo="'+(termo? "1" : "")+'">'+(carta? "Li e assino a carta" : termo? "Li e aceito "+oque : "Li e estou ciente")+'</button>' +
             '<div class="d" style="margin-top:6px;">'+(termo? "O aceite registra seu nome, a data, a hora e o endereço de internet (IP) e vale como sua concordância com "+oque+". Se preferir, assine também o PDF enviado pelo escritório." :
               "A confirmação registra a data, a hora e o endereço de internet (IP). Ela indica que você leu o comunicado; não significa concordância com o conteúdo.")+'</div></div>') +
         '</details>';
@@ -352,6 +352,33 @@ function ligarNotificacoes(){
     w.document.write('<!doctype html><meta charset="utf-8"><title>Notificação</title><body style="font-family:Arial,sans-serif;font-size:13px;line-height:1.5;max-width:720px;margin:30px auto;white-space:pre-wrap;">'+el.innerHTML+'</body>');
     w.document.close(); w.focus(); w.print();
   }; });
+}
+/* ---------- monitor de vendas e compras (12 meses) ---------- */
+function htmlMovimento(e){
+  var m = (dados.movimento||[]).find(function(x){ return x.empresa_id===e.id; });
+  if(!m || !(m.meses||[]).length) return "";
+  var meses = m.meses, max = 0, tv = 0, tc = 0, ano = String(new Date().getFullYear());
+  meses.forEach(function(x){ max = Math.max(max, Number(x.vendas)||0, Number(x.compras)||0); if(x.ym.slice(0,4)===ano){ tv += Number(x.vendas)||0; tc += Number(x.compras)||0; } });
+  if(!max) return '<div class="card"><h2>📊 Vendas e compras</h2><div class="sub">Assim que o escritório lançar as suas notas, o resumo aparece aqui.</div></div>';
+  var NM = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"];
+  var R = function(v){ return Number(v||0).toLocaleString("pt-BR",{style:"currency",currency:"BRL"}); };
+  var bar = function(v){ return Math.max(1, Math.round((Number(v)||0)/max*100)); };
+  var limite = "";
+  if(m.regime==="MEI"){
+    var ini = m.constituicao && String(m.constituicao).slice(0,4)===ano? Number(String(m.constituicao).slice(5,7)) : 1;
+    var lim = 81000/12*(13-ini), pct = Math.round(Number(m.vendas_ano||0)/lim*100);
+    limite = '<div class="d" style="margin-top:8px;">Limite do MEI em '+ano+': '+R(lim)+(ini>1? " (proporcional à abertura)" : "")+' · usado: <strong style="color:'+(pct>=100? "#dc2626" : pct>=80? "#b45309" : "inherit")+'">'+pct+'%</strong></div>' +
+      '<div style="height:8px;border-radius:6px;background:#e5e7eb;margin-top:4px;overflow:hidden;"><div style="height:100%;width:'+Math.min(100,pct)+'%;background:'+(pct>=100? "#dc2626" : pct>=80? "#f59e0b" : "#16a34a")+'"></div></div>' +
+      (pct>=80? '<div class="d" style="margin-top:6px;color:#b45309;">Atenção: o faturamento está perto do limite do MEI. Fale com o escritório antes de emitir novas notas.</div>' : '');
+  }
+  return '<div class="card"><h2>📊 Vendas e compras</h2><div class="sub">Notas lançadas pelo escritório nos últimos 12 meses</div>' +
+    '<div style="display:flex;gap:14px;flex-wrap:wrap;margin:10px 0 4px;font-size:.85rem;"><span><b style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#0b1f3a;margin-right:4px;"></b>Vendas em '+ano+': <strong>'+R(tv)+'</strong></span>' +
+      '<span><b style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#c9a227;margin-right:4px;"></b>Compras em '+ano+': <strong>'+R(tc)+'</strong></span></div>' +
+    '<div style="display:flex;align-items:flex-end;gap:4px;height:120px;border-bottom:1px solid #e5e7eb;">' + meses.map(function(x){
+      return '<div style="flex:1;display:flex;align-items:flex-end;justify-content:center;gap:1px;height:100%;" title="'+NM[Number(x.ym.slice(5,7))-1]+'/'+x.ym.slice(2,4)+' · vendas '+R(x.vendas)+' · compras '+R(x.compras)+'">' +
+        '<i style="display:block;width:45%;max-width:12px;height:'+bar(x.vendas)+'%;background:#0b1f3a;border-radius:2px 2px 0 0;"></i><i style="display:block;width:45%;max-width:12px;height:'+bar(x.compras)+'%;background:#c9a227;border-radius:2px 2px 0 0;"></i></div>'; }).join("") + '</div>' +
+    '<div style="display:flex;gap:4px;font-size:.62rem;color:#64748b;">'+meses.map(function(x){ return '<span style="flex:1;text-align:center;">'+NM[Number(x.ym.slice(5,7))-1]+'</span>'; }).join("")+'</div>' +
+    limite + '</div>';
 }
 /* ---------- pendências com o escritório (documentos do mês + honorário em atraso) ---------- */
 function htmlPendenciasMes(e, abertas){
