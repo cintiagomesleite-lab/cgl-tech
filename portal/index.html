@@ -404,7 +404,43 @@ var ENT_MOTIVO = {NOTAS_VENDA:"para apurar o imposto do mês com tempo de confer
   FOLHA:"para calcular e conferir a folha antes do pagamento dos salários", EXTRATO:"para conciliar o banco e fechar a contabilidade",
   DESPESAS:"para lançar as despesas na contabilidade", OUTROS:"para concluir o fechamento do mês"};
 var DIAS_SEM = ["dom","seg","ter","qua","qui","sex","sáb"];
-function entregasDe(e){ return dados.entregas? dados.entregas.filter(function(x){ return x.empresa_id===e.id; }) : null; }
+function entregasDe(e){
+  if(dados.entregas){ var l = dados.entregas.filter(function(x){ return x.empresa_id===e.id; }); if(l.length) return l; }
+  return entregasPadrao(e);
+}
+/* ---------- prazos calculados aqui mesmo (padrão do escritório), quando o banco ainda não mandou o calendário ---------- */
+function _pascoa(y){ var a=y%19,b=Math.floor(y/100),c=y%100,d=Math.floor(b/4),e=b%4,f=Math.floor((b+8)/25),g=Math.floor((b-f+1)/3),h=(19*a+b-d-g+15)%30,i=Math.floor(c/4),k=c%4,l=(32+2*e+2*i-h-k)%7,m=Math.floor((a+11*h+22*l)/451); return new Date(y, Math.floor((h+l-7*m+114)/31)-1, ((h+l-7*m+114)%31)+1, 12); }
+function _iso(d){ return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); }
+function _util(d){
+  var w = d.getDay(); if(w===0 || w===6) return false;
+  var md = _iso(d).slice(5); if(["01-01","04-21","05-01","09-07","10-12","11-02","11-15","11-20","12-25"].indexOf(md)>=0) return false;
+  var p = _pascoa(d.getFullYear()), t = Math.round((new Date(d.getFullYear(), d.getMonth(), d.getDate(), 12) - p)/864e5);
+  return [-48,-47,-2,60].indexOf(t)<0;
+}
+function _ultDU(a, m){ var d = new Date(a, m, 0, 12); while(!_util(d)) d.setDate(d.getDate()-1); return d; }
+function _nDU(a, m, n){ var d = new Date(a, m-1, 1, 12), c = 0; while(true){ if(_util(d) && ++c===n) return d; d.setDate(d.getDate()+1); } }
+function _antes(d, n){ d = new Date(d); var c = 0; while(c<n){ d.setDate(d.getDate()-1); if(_util(d)) c++; } return d; }
+function _prazoPadrao(cod, a, m){
+  var r = cod==="NOTAS_VENDA" || cod==="NOTAS_COMPRA"? _ultDU(a, m) : cod==="FOLHA"? _antes(_ultDU(a, m), 5) : _nDU(m===12? a+1 : a, m===12? 1 : m+1, cod==="OUTROS"? 5 : 3);
+  /* nunca menos de 7 dias antes do prazo final do escritório (DAS no dia 20; folha no 5º dia útil) */
+  var as = m===12? a+1 : a, ms = m===12? 1 : m+1, ref;
+  if(cod==="FOLHA") ref = _nDU(as, ms, 5); else { ref = new Date(as, ms-1, 20, 12); while(!_util(ref)) ref.setDate(ref.getDate()+1); }
+  var lim = new Date(ref); lim.setDate(lim.getDate()-7); while(!_util(lim)) lim.setDate(lim.getDate()-1);
+  return {prazo:_iso(r<lim? r : lim), ref:_iso(ref), refNome: cod==="FOLHA"? "pagamento dos salários" : "vencimento do imposto do mês (DAS)"};
+}
+function entregasPadrao(e){
+  var dm = (dados.docs_mes||[]).find(function(x){ return x.empresa_id===e.id; }); if(!dm || !(dm.docs||[]).length) return null;
+  var h = hoje(), base = new Date(Number(h.slice(0,4)), Number(h.slice(5,7))-1, 1, 12), out = [], compAnt = String(dm.competencia).slice(0,7);
+  [-1, 0, 1].forEach(function(k){
+    var d = new Date(base); d.setMonth(d.getMonth()+k); var a = d.getFullYear(), m = d.getMonth()+1, comp = a+"-"+String(m).padStart(2,"0");
+    dm.docs.forEach(function(x){
+      var p = _prazoPadrao(x.codigo, a, m), rec = comp===compAnt? !!x.recebido : false;
+      if(comp!==compAnt && p.prazo<h) return;            /* sem informação de recebimento: não mostra como atrasado */
+      out.push({empresa_id:e.id, competencia:comp+"-01", codigo:x.codigo, nome:x.nome, prazo:p.prazo, recebido:rec, prazo_escritorio:p.ref, ref:p.refNome});
+    });
+  });
+  return out.sort(function(a,b){ return a.prazo<b.prazo? -1 : a.prazo>b.prazo? 1 : 0; });
+}
 var entMesSel = "", entDiaSel = "";
 function htmlEntregas(e){
   var l = entregasDe(e); if(!l || !l.length) return "";
