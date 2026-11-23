@@ -112,6 +112,10 @@ select.campo,textarea.campo{width:100%;padding:11px;border:1px solid var(--line)
 .ecal-leg{display:flex;gap:12px;flex-wrap:wrap;font-size:.72rem;color:#64748b;margin-top:8px}
 .ecal-leg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:4px;vertical-align:middle}
 .ecal-leg i.tem{background:#f59e0b}.ecal-leg i.atraso{background:#dc2626}.ecal-leg i.ok{background:#059669}
+.env-zip{display:flex!important;text-transform:none;letter-spacing:0;gap:8px;align-items:flex-start;margin:10px 0 4px;padding:10px 12px;border:1px solid #e5e7eb;border-radius:10px;background:#f8fafc;font-size:.88rem;cursor:pointer}
+.env-zip input{margin:3px 0 0;width:18px!important;height:18px;flex:0 0 18px;padding:0}
+.env-zip span{flex:1;text-align:left;font-weight:400;color:#0f172a}
+.env-zip small{color:#64748b}
 </style>
 </head>
 <body>
@@ -594,6 +598,7 @@ function htmlEnvio(e){
     '<div class="env-drop" id="envDrop"><strong>Toque aqui para escolher os arquivos</strong><span>ou arraste para cá · PDF, XML, ZIP, foto, Excel — até '+ENV_MAX_MB+' MB cada</span>' +
     '<input type="file" id="envInp" multiple accept="'+Object.keys(ENV_TIPOS).map(function(x){ return "."+x; }).join(",")+'"></div>' +
     '<div id="envForm" style="display:none;margin-top:10px;"><div id="envLista"></div>' +
+    '<label class="env-zip" id="envZipBox" style="display:none;"><input type="checkbox" id="envZip" checked> 📦 <span><strong>Juntar tudo em uma pasta .zip</strong><br><small>Os arquivos chegam ao escritório todos juntos, num único envio.</small></span></label>' +
     '<label for="envCat">O que você está enviando?</label><select class="campo" id="envCat">'+Object.keys(ENV_CAT).map(function(k){ return '<option value="'+k+'"'+(k===envCatSel?" selected":"")+'>'+ENV_CAT[k]+'</option>'; }).join("")+'</select>' +
     '<label for="envMes">Mês de referência</label><input type="month" id="envMes" value="'+mesAnteriorISO()+'">' +
     '<label for="envObs">Recado para o escritório (opcional)</label><textarea class="campo" id="envObs" rows="2" maxlength="500" placeholder="Ex.: notas de outubro, faltou uma que mando amanhã"></textarea>' +
@@ -611,6 +616,7 @@ function ligarEnvio(e){
     document.getElementById("envLista").innerHTML = envFila.map(function(f, i){
       return '<div class="env-arq"><span style="word-break:break-all;">📄 '+esc(f.name)+' <span style="color:var(--ink-soft);">('+(f.size<1048576? Math.max(1,Math.round(f.size/1024))+' KB' : (f.size/1048576).toFixed(1).replace(".",",")+' MB')+')</span></span><button data-tira="'+i+'" aria-label="Tirar">✕</button></div>'; }).join("");
     Array.prototype.forEach.call(document.querySelectorAll("[data-tira]"), function(b){ b.onclick = function(){ envFila.splice(Number(b.getAttribute("data-tira")),1); lista(); }; });
+    var zb = document.getElementById("envZipBox"); if(zb) zb.style.display = envFila.length>1 && !envFila.every(function(f){ return /\.zip$/i.test(f.name); })? "" : "none";
     var cat = document.getElementById("envCat");
     if(cat && !envCatSel && envFila.length && envFila.every(function(f){ return /\.(xml|zip)$/i.test(f.name); })) cat.value = "NOTA_FISCAL";
   }
@@ -632,9 +638,14 @@ function ligarEnvio(e){
   document.getElementById("envBtn").onclick = async function(){
     var b = this, escId = (dados.escritorio||{}).id, cat = document.getElementById("envCat").value, mes = document.getElementById("envMes").value, obs = document.getElementById("envObs").value;
     if(!envFila.length || !escId) return;
-    b.disabled = true; var ok = 0, falhas = [];
-    for(var i=0;i<envFila.length;i++){
-      var f = envFila[i]; b.textContent = "Enviando "+(i+1)+" de "+envFila.length+"…";
+    b.disabled = true; var ok = 0, falhas = [], fila = envFila.slice(), nOrig = fila.length;
+    var zipar = fila.length>1 && document.getElementById("envZipBox").style.display!=="none" && document.getElementById("envZip").checked;
+    if(zipar){
+      try{ b.textContent = "Juntando "+fila.length+" arquivos em .zip…"; fila = await envZipar(fila, cat, mes, e); }
+      catch(err){ b.disabled = false; b.textContent = "Enviar"; return toast(err.message||"Não foi possível montar o .zip. Desmarque a opção e envie os arquivos soltos."); }
+    }
+    for(var i=0;i<fila.length;i++){
+      var f = fila[i]; b.textContent = "Enviando "+(i+1)+" de "+fila.length+"…";
       var path = escId+"/cliente/"+e.id+"/"+Date.now()+"_"+Math.random().toString(36).slice(2,8)+"_"+envNomeSeguro(f.name);
       var up = await sb.storage.from("documentos").upload(path, f, {upsert:false, contentType:envTipo(f.name)});
       if(up.error){ falhas.push(f.name); continue; }
@@ -646,10 +657,41 @@ function ligarEnvio(e){
       ok++;
     }
     envFila = []; envCatSel = "";
-    if(ok) toast(ok===1? "Arquivo enviado ao escritório! ✓" : ok+" arquivos enviados ao escritório! ✓");
+    if(ok) toast(zipar? (ok===1? nOrig+" arquivos enviados juntos em uma pasta .zip! ✓" : nOrig+" arquivos enviados em "+ok+" pastas .zip! ✓") : ok===1? "Arquivo enviado ao escritório! ✓" : ok+" arquivos enviados ao escritório! ✓");
     if(falhas.length) setTimeout(function(){ toast("Não foi possível enviar: "+falhas.join("; ")); }, ok? 3300 : 0);
     carregar();
   };
+}
+/* ---------- junta os arquivos em .zip (em partes de até ~19 MB, o limite de cada envio) ---------- */
+var _jszipP = null;
+function carregarJSZip(){
+  if(window.JSZip) return Promise.resolve(window.JSZip);
+  if(_jszipP) return _jszipP;
+  _jszipP = new Promise(function(ok, falha){
+    var s = document.createElement("script"); s.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+    s.onload = function(){ if(window.JSZip) ok(window.JSZip); else { _jszipP = null; falha(new Error("Não foi possível montar o .zip. Envie os arquivos soltos.")); } }; s.onerror = function(){ _jszipP = null; falha(new Error("Sem conexão para montar o .zip. Tente de novo ou envie os arquivos soltos.")); };
+    document.head.appendChild(s);
+  });
+  return _jszipP;
+}
+async function envZipar(arqs, cat, mes, e){
+  var JSZip = await carregarJSZip(), LIM = 19*1024*1024, partes = [], atual = [], tam = 0;
+  arqs.forEach(function(f){ if(atual.length && tam+f.size>LIM){ partes.push(atual); atual = []; tam = 0; } atual.push(f); tam += f.size; });
+  if(atual.length) partes.push(atual);
+  var rot = String(ENV_CAT[cat] || (cat.indexOf("DOC:")===0? cat.slice(4) : cat) || "documentos").split(/[(\/—]/)[0].trim();
+  var base = envNomeSeguro(rot+"_"+(mes||mesAnteriorISO())+"_"+(e.nome_fantasia||e.razao_social||"empresa")).replace(/_+/g,"_").slice(0,70);
+  var out = [];
+  for(var p=0; p<partes.length; p++){
+    var z = new JSZip(), usados = {};
+    partes[p].forEach(function(f){
+      var nome = f.name, n = 2; while(usados[nome.toLowerCase()]){ nome = f.name.replace(/(\.[^.]+)?$/, " ("+(n++)+")$1"); } usados[nome.toLowerCase()] = true;
+      z.file(nome, f);
+    });
+    var blob = await z.generateAsync({type:"blob", compression:"DEFLATE", compressionOptions:{level:6}, mimeType:"application/zip"});
+    if(blob.size > ENV_MAX_MB*1024*1024) throw new Error("A pasta .zip ficou maior que "+ENV_MAX_MB+" MB. Envie em menos arquivos por vez.");
+    out.push(new File([blob], base+(partes.length>1? "_parte"+(p+1) : "")+".zip", {type:"application/zip"}));
+  }
+  return out;
 }
 function addDiasISO(iso, n){ var d = new Date(iso+"T12:00:00"); d.setDate(d.getDate()+n); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); }
 
