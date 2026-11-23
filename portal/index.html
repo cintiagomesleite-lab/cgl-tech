@@ -314,7 +314,7 @@ function desenhar(){
   Array.prototype.forEach.call(document.querySelectorAll("[data-enviar-doc]"), function(b){ b.onclick = function(){
     envCatSel = DOC_PARA_CAT[b.getAttribute("data-enviar-doc")] || "";
     var cat = document.getElementById("envCat"); if(cat && envCatSel) cat.value = envCatSel;
-    var mesEl = document.getElementById("envMes"), cp = b.getAttribute("data-comp"); if(mesEl && cp) mesEl.value = cp;
+    var mesEl = document.getElementById("envMes"), cp = b.getAttribute("data-comp"); if(mesEl && cp){ mesEl.value = cp; envMesFixo = true; }
     var dr = document.getElementById("envDrop"); if(dr) dr.scrollIntoView({behavior:"smooth", block:"center"});
     var inp = document.getElementById("envInp"); if(inp) inp.click();
   }; });
@@ -608,9 +608,21 @@ function htmlEnvio(e){
       return '<div class="item"><div class="main"><div class="t" style="font-weight:500;word-break:break-all;">'+esc(x.nome_arquivo)+tag+'</div><div class="d">'+esc(ENV_CAT[x.categoria]||x.categoria)+(x.competencia? " · "+esc(compLabel(x.competencia)) : "")+' · enviado em '+fmtData(x.criado_em)+'</div></div></div>'; }).join("") : '') +
     '</div>';
 }
+/* qual documento do calendário cada tipo de envio dá como entregue */
+var CAT_PARA_DOC = {NOTA_FISCAL:"NOTAS_VENDA", NOTA_COMPRA:"NOTAS_COMPRA", EXTRATO:"EXTRATO"}, envMesFixo = false;
+function envDocDaCat(cat){ return cat && cat.indexOf("DOC:")===0? cat.slice(4) : CAT_PARA_DOC[cat] || ""; }
+/* mês sugerido: o mais antigo desse documento que ainda está pendente no calendário */
+function envMesSugerido(e, cat){
+  var cod = envDocDaCat(cat), l = cod? (entregasDe(e)||[]).filter(function(x){ return x.codigo===cod && !x.recebido; }) : [];
+  l.sort(function(a,b){ return a.prazo<b.prazo? -1 : 1; });
+  return l.length? String(l[0].competencia).slice(0,7) : "";
+}
 function ligarEnvio(e){
   var inp = document.getElementById("envInp"); if(!inp) return;
   var drop = document.getElementById("envDrop"), form = document.getElementById("envForm");
+  function sugerirMes(){ if(envMesFixo) return; var m = envMesSugerido(e, (document.getElementById("envCat")||{}).value), el = document.getElementById("envMes"); if(m && el) el.value = m; }
+  var catEl = document.getElementById("envCat"); if(catEl) catEl.addEventListener("change", function(){ envMesFixo = false; sugerirMes(); });
+  var mesEl0 = document.getElementById("envMes"); if(mesEl0) mesEl0.addEventListener("change", function(){ envMesFixo = true; });
   function lista(){
     form.style.display = envFila.length? "" : "none";
     document.getElementById("envLista").innerHTML = envFila.map(function(f, i){
@@ -619,6 +631,7 @@ function ligarEnvio(e){
     var zb = document.getElementById("envZipBox"); if(zb) zb.style.display = envFila.length>1 && !envFila.every(function(f){ return /\.zip$/i.test(f.name); })? "" : "none";
     var cat = document.getElementById("envCat");
     if(cat && !envCatSel && envFila.length && envFila.every(function(f){ return /\.(xml|zip)$/i.test(f.name); })) cat.value = "NOTA_FISCAL";
+    sugerirMes();
   }
   function somar(arqs){
     var recusados = [];
@@ -656,7 +669,10 @@ function ligarEnvio(e){
       if(docCod && r.data){ try{ await sb.rpc("portal_vincular_doc", {p_envio:r.data, p_codigo:docCod, p_competencia: mes? mes+"-01" : null}); }catch(_){} }
       ok++;
     }
-    envFila = []; envCatSel = "";
+    /* o que foi enviado já sai das pendências na hora (o banco confirma ao recarregar) */
+    var codEnv = envDocDaCat(cat);
+    if(ok && codEnv && mes && dados.entregas) dados.entregas.forEach(function(x){ if(x.empresa_id===e.id && x.codigo===codEnv && String(x.competencia).slice(0,7)===mes) x.recebido = true; });
+    envFila = []; envCatSel = ""; envMesFixo = false;
     if(ok) toast(zipar? (ok===1? nOrig+" arquivos enviados juntos em uma pasta .zip! ✓" : nOrig+" arquivos enviados em "+ok+" pastas .zip! ✓") : ok===1? "Arquivo enviado ao escritório! ✓" : ok+" arquivos enviados ao escritório! ✓");
     if(falhas.length) setTimeout(function(){ toast("Não foi possível enviar: "+falhas.join("; ")); }, ok? 3300 : 0);
     carregar();
